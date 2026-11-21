@@ -70,7 +70,7 @@ impl Config {
             use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
             timing: env_bool("TIMING", false),
             links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
-            overlap: env_bool("SHOP_OVERLAP", false),
+            overlap: env_bool("SHOP_OVERLAP", true),
             bitfilter_bits: env::var("SHOP_BITFILTER_BITS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
