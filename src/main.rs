@@ -24,10 +24,46 @@ const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
 const SEVEN_DAYS_REL: u32 = SEVEN_DAYS_MS as u32;
 const SESSION_GAP_REL: u32 = (30 * 60 * 1_000) as u32;
 
-const NUM_DEDUP_SHARDS: usize = 512;
-const DEDUP_SHIFT: u32 = 55; // 64 - 9
-const NUM_PERSON_SHARDS: usize = 256;
-const PERSON_SHIFT: u32 = 56; // 64 - 8
+// Shard counts are chosen once at startup from the event input size (see `init_shard_bits`),
+// so per-shard dedup tables and person maps stay cache-sized as the input grows.
+static DEDUP_BITS: AtomicU32 = AtomicU32::new(9);
+static PERSON_BITS: AtomicU32 = AtomicU32::new(8);
+
+#[inline(always)]
+fn num_dedup_shards() -> usize {
+    1usize << DEDUP_BITS.load(Ordering::Relaxed)
+}
+#[inline(always)]
+fn dedup_shift() -> u32 {
+    64 - DEDUP_BITS.load(Ordering::Relaxed)
+}
+#[inline(always)]
+fn num_person_shards() -> usize {
+    1usize << PERSON_BITS.load(Ordering::Relaxed)
+}
+#[inline(always)]
+fn person_shift() -> u32 {
+    64 - PERSON_BITS.load(Ordering::Relaxed)
+}
+
+/// Dedup shards: one per ~2 MB of event CSV, rounded up to a power of two, clamped to 2^9..2^11
+/// (2^10 at ~20M events, 2^11 at ~60M). Person shards are half as many.
+/// SHOP_DEDUP_BITS / SHOP_PERSON_BITS (4..=12) override, for tests and A/B runs.
+fn init_shard_bits(event_bytes: u64) {
+    let units = ((event_bytes / (2 << 20)) as usize).max(1).next_power_of_two();
+    let auto = units.trailing_zeros().clamp(9, 11);
+    let bits = |name: &str, default: u32| -> u32 {
+        env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|b| (4..=12).contains(b))
+            .unwrap_or(default)
+    };
+    let d = bits("SHOP_DEDUP_BITS", auto);
+    let p = bits("SHOP_PERSON_BITS", d - 1);
+    DEDUP_BITS.store(d, Ordering::Relaxed);
+    PERSON_BITS.store(p, Ordering::Relaxed);
+}
 
 const BITFILTER_BITS_DEFAULT: u32 = 24; // 2 MiB
 
@@ -1429,16 +1465,17 @@ fn read_events_parallel(
         return Ok(WorkerMatrix::new(Vec::new()));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(64);
+    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * num_dedup_shards())).max(64);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<RawEvent>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut out: Vec<Vec<RawEvent>> = (0..NUM_DEDUP_SHARDS)
+                let mut out: Vec<Vec<RawEvent>> = (0..num_dedup_shards())
                     .map(|_| Vec::with_capacity(per_shard_cap))
                     .collect();
-                let mut wc: WcSink<RawEvent, 2> = WcSink::new(NUM_DEDUP_SHARDS, cfg.use_wc);
+                let mut wc: WcSink<RawEvent, 2> = WcSink::new(num_dedup_shards(), cfg.use_wc);
+                let dshift = dedup_shift();
                 let mut dc_ing = DateCache::new();
                 let mut dc_ts = DateCache::new();
                 let mut buf = Vec::new();
@@ -1504,7 +1541,7 @@ fn read_events_parallel(
                             } else {
                                 Key::EMPTY
                             };
-                            let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
+                            let shard = (event_id.hash64() >> dshift) as usize;
                             wc.push(
                                 shard,
                                 RawEvent {
@@ -1542,13 +1579,14 @@ fn read_clicks_parallel(
         return Ok(WorkerMatrix::new(Vec::new()));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
+    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * num_person_shards())).max(32);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<PersonClick>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut out: Vec<Vec<PersonClick>> = (0..NUM_PERSON_SHARDS)
+                let pshift = person_shift();
+                let mut out: Vec<Vec<PersonClick>> = (0..num_person_shards())
                     .map(|_| Vec::with_capacity(per_click_shard_cap))
                     .collect();
                 let mut dc = DateCache::new();
@@ -1584,7 +1622,7 @@ fn read_clicks_parallel(
                             let raw_uid = Key::from_bytes(uid);
                             let person_id = links.resolve(raw_uid, &mut link_cache);
                             let click_id = Key::from_bytes(clid);
-                            let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                            let shard = (person_id.hash64() >> pshift) as usize;
                             out[shard].push(PersonClick {
                                 person_id,
                                 click_id,
@@ -1766,6 +1804,13 @@ fn main() -> io::Result<()> {
     let (campaigns, campaign_list) = load_campaigns(&data_dir.join("campaigns.csv"))?;
     let organic_idx = campaign_list.len() - 1;
 
+    let event_bytes: u64 = list_csvs(&data_dir.join("events"))?
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    init_shard_bits(event_bytes);
+
     let t0 = Instant::now();
     let (links, ms_links, event_shards, ms_events_io) = if cfg.overlap {
         // Links construction runs beside event parsing; dedup (the first links
@@ -1821,11 +1866,11 @@ fn main() -> io::Result<()> {
     let total_raw_events: usize = if ew == 0 {
         0
     } else {
-        (0..NUM_DEDUP_SHARDS)
+        (0..num_dedup_shards())
             .map(|sh| event_shards.shard_len(sh))
             .sum()
     };
-    let per_person_shard_cap = (total_raw_events / (ncpu * NUM_PERSON_SHARDS)).max(64);
+    let per_person_shard_cap = (total_raw_events / (ncpu * num_person_shards())).max(64);
     let next_shard = AtomicUsize::new(0);
     let pe_workers: Vec<Vec<Vec<PersonEvent>>> = if ew == 0 {
         Vec::new()
@@ -1836,17 +1881,19 @@ fn main() -> io::Result<()> {
                 handles.push(s.spawn(|| {
                     let mut table = DedupTable::new(1 << 14);
                     let mut kept: Vec<RawEvent> = Vec::new();
-                    let mut out: Vec<Vec<PersonEvent>> = (0..NUM_PERSON_SHARDS)
+                    let mut out: Vec<Vec<PersonEvent>> = (0..num_person_shards())
                         .map(|_| Vec::with_capacity(per_person_shard_cap))
                         .collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
-                    let mut pwc: WcSink<PersonEvent, 4> = WcSink::new(NUM_PERSON_SHARDS, cfg.use_wc);
+                    let mut pwc: WcSink<PersonEvent, 4> = WcSink::new(num_person_shards(), cfg.use_wc);
+                    let pshift = person_shift();
+                    let n_dedup = num_dedup_shards();
                     let mut seen_bm: Vec<u64> = Vec::new();
                     let mut dup_bm: Vec<u64> = Vec::new();
 
                     loop {
                         let sh = next_shard.fetch_add(1, Ordering::Relaxed);
-                        if sh >= NUM_DEDUP_SHARDS {
+                        if sh >= n_dedup {
                             break;
                         }
                         let total_len = event_shards.shard_len(sh);
@@ -1900,7 +1947,7 @@ fn main() -> io::Result<()> {
                                                 links.prefetch(raw[i + 16].user_id);
                                             }
                                             let person_id = links.resolve(ev.user_id, &mut link_cache);
-                                            let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                                            let psh = (person_id.hash64() >> pshift) as usize;
                                             let packed_ev =
                                                 ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
                                             pwc.push(psh, PersonEvent { person_id, packed_ev }, &mut out);
@@ -1928,7 +1975,7 @@ fn main() -> io::Result<()> {
                             let ev = kept[i];
                             if ev.ts_rel != u32::MAX {
                                 let person_id = links.resolve(ev.user_id, &mut link_cache);
-                                let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                                let psh = (person_id.hash64() >> pshift) as usize;
                                 let packed_ev =
                                     ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
                                 pwc.push(psh, PersonEvent { person_id, packed_ev }, &mut out);
@@ -1965,7 +2012,7 @@ fn main() -> io::Result<()> {
     let t4 = Instant::now();
     let pew = person_event_shards.num_workers();
     let pcw = person_click_shards.num_workers();
-    let mut shard_order: Vec<(usize, usize)> = (0..NUM_PERSON_SHARDS)
+    let mut shard_order: Vec<(usize, usize)> = (0..num_person_shards())
         .map(|sh| {
             let cnt = if pew > 0 {
                 person_event_shards.shard_len(sh)
@@ -2014,7 +2061,7 @@ fn main() -> io::Result<()> {
 
                 loop {
                     let order_idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if order_idx >= NUM_PERSON_SHARDS {
+                    if order_idx >= num_person_shards() {
                         break;
                     }
                     let (sh, total_evs) = order_ref[order_idx];
