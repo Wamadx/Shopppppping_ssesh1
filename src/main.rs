@@ -36,6 +36,7 @@ struct Config {
     chunk_bytes: usize,
     use_bitfilter: bool,
     use_sortless: bool,
+    use_prefetch: bool,
     timing: bool,
 }
 
@@ -52,11 +53,12 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&k| k >= 64)
-            .unwrap_or(512);
+            .unwrap_or(1024);
         Self {
             chunk_bytes: chunk_kb * 1024,
             use_bitfilter: env_bool("SHOP_BITFILTER", true),
             use_sortless: env_bool("SHOP_SORTLESS", false),
+            use_prefetch: env_bool("SHOP_PREFETCH", false),
             timing: env_bool("TIMING", false),
         }
     }
@@ -124,9 +126,9 @@ impl<V: Copy + Default> KeyMap<V> {
     }
 
     #[inline]
-    fn insert(&mut self, key: Key, val: V) {
+    fn insert_with_hash(&mut self, key: Key, h: u64, val: V) {
         let k = key.0;
-        let mut idx = (key.hash64() as usize) & self.mask;
+        let mut idx = (h as usize) & self.mask;
         loop {
             let e = &mut self.entries[idx];
             if e.0 == 0 || e.0 == k {
@@ -135,6 +137,11 @@ impl<V: Copy + Default> KeyMap<V> {
             }
             idx = (idx + 1) & self.mask;
         }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: Key, val: V) {
+        self.insert_with_hash(key, key.hash64(), val);
     }
 
     #[inline(always)]
@@ -204,13 +211,9 @@ impl LinkTable {
     }
 }
 
-/// Parses unsigned decimal ID suffix without leading zeros (`p123` -> `Some(123)`, `p01` -> `None`).
+/// Parses unsigned decimal ID suffix without leading zeros (`123` -> `Some(123)`, `01` -> `None`).
 #[inline(always)]
-fn try_parse_id_num(s: &[u8], prefix: &[u8], max_val: usize) -> Option<usize> {
-    if !s.starts_with(prefix) {
-        return None;
-    }
-    let rest = &s[prefix.len()..];
+fn parse_dec_suffix(rest: &[u8]) -> Option<usize> {
     let len = rest.len();
     if len == 0 || len > 6 {
         return None;
@@ -219,18 +222,18 @@ fn try_parse_id_num(s: &[u8], prefix: &[u8], max_val: usize) -> Option<usize> {
         return None;
     }
     let mut val = 0usize;
+    let mut bad = 0u8;
     for &b in rest {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + ((b - b'0') as usize);
+        let d = b.wrapping_sub(b'0');
+        bad |= (d > 9) as u8;
+        val = val * 10 + (d as usize);
     }
-    if val <= max_val { Some(val) } else { None }
+    if bad == 0 { Some(val) } else { None }
 }
 
-const FAST_P_LEN: usize = 131_072;
+const FAST_P_CAP: usize = 131_072;
 struct ProductCatalog {
-    fast_p: Vec<u16>,
+    fast_p: Vec<u8>,
     fallback: KeyMap<u16>,
     has_fallback: bool,
 }
@@ -238,9 +241,15 @@ struct ProductCatalog {
 impl ProductCatalog {
     #[inline(always)]
     fn get(&self, pid: &[u8], unknown_cat_id: u16) -> u16 {
-        if let Some(num) = try_parse_id_num(pid, b"p", FAST_P_LEN - 1) {
-            let c = unsafe { *self.fast_p.get_unchecked(num) };
-            return if c != u16::MAX { c } else { unknown_cat_id };
+        if pid.len() >= 2 && pid[0] == b'p' {
+            if let Some(num) = parse_dec_suffix(&pid[1..]) {
+                if num < self.fast_p.len() {
+                    return unsafe { *self.fast_p.get_unchecked(num) as u16 };
+                }
+                if num < FAST_P_CAP {
+                    return unknown_cat_id;
+                }
+            }
         }
         if self.has_fallback {
             return self.fallback.get(Key::from_bytes(pid)).unwrap_or(unknown_cat_id);
@@ -249,7 +258,7 @@ impl ProductCatalog {
     }
 }
 
-const FAST_C_LEN: usize = 16_384;
+const FAST_C_CAP: usize = 16_384;
 struct CampaignCatalog {
     fast_c: Vec<u16>,
     fallback: KeyMap<u16>,
@@ -259,9 +268,16 @@ struct CampaignCatalog {
 impl CampaignCatalog {
     #[inline(always)]
     fn get(&self, cid: &[u8]) -> Option<u16> {
-        if let Some(num) = try_parse_id_num(cid, b"c_", FAST_C_LEN - 1) {
-            let c = unsafe { *self.fast_c.get_unchecked(num) };
-            return if c != u16::MAX { Some(c) } else { None };
+        if cid.len() >= 3 && cid[0] == b'c' && cid[1] == b'_' {
+            if let Some(num) = parse_dec_suffix(&cid[2..]) {
+                if num < self.fast_c.len() {
+                    let c = unsafe { *self.fast_c.get_unchecked(num) };
+                    return if c != u16::MAX { Some(c) } else { None };
+                }
+                if num < FAST_C_CAP {
+                    return None;
+                }
+            }
         }
         if self.has_fallback {
             return self.fallback.get(Key::from_bytes(cid));
@@ -292,6 +308,12 @@ impl DedupTable {
         }
         self.slots[..cap].fill(0);
         self.mask = cap - 1;
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, eid: Key) {
+        let idx = (eid.hash64() as usize) & self.mask;
+        prefetch_ro(self.slots.as_ptr().wrapping_add(idx));
     }
 
     #[inline(always)]
@@ -348,6 +370,13 @@ impl LocalPersonMap {
             self.stamps.fill(0);
             self.epoch = 1;
         }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, key: Key) {
+        let idx = (key.hash64() as usize) & self.mask;
+        prefetch_ro(self.stamps.as_ptr().wrapping_add(idx));
+        prefetch_ro(self.entries.as_ptr().wrapping_add(idx));
     }
 
     #[inline(always)]
@@ -467,15 +496,33 @@ fn load_products(path: &Path) -> io::Result<(ProductCatalog, Vec<Box<[u8]>>, u16
     }
     let unknown_id = remap[0];
 
-    let mut fast_p = vec![u16::MAX; FAST_P_LEN];
+    let mut fast_items: Vec<(u32, u8)> = Vec::with_capacity(raw_pairs.len());
+    let mut max_fast: isize = -1;
     let mut fallback_items: Vec<(Key, u16)> = Vec::new();
     for (pid, raw_cid) in raw_pairs {
         let cid = remap[raw_cid];
-        if let Some(num) = try_parse_id_num(pid, b"p", FAST_P_LEN - 1) {
-            fast_p[num] = cid;
-        } else {
-            fallback_items.push((Key::from_bytes(pid), cid));
+        if pid.len() >= 2 && pid[0] == b'p' {
+            if let Some(num) = parse_dec_suffix(&pid[1..]) {
+                if num < FAST_P_CAP {
+                    fast_items.push((num as u32, cid as u8));
+                    if (num as isize) > max_fast {
+                        max_fast = num as isize;
+                    }
+                    continue;
+                }
+            }
         }
+        fallback_items.push((Key::from_bytes(pid), cid));
+    }
+
+    let fast_len = if max_fast >= 0 {
+        (max_fast as usize + 1).min(FAST_P_CAP)
+    } else {
+        0
+    };
+    let mut fast_p = vec![unknown_id as u8; fast_len];
+    for (num, cid) in fast_items {
+        fast_p[num as usize] = cid;
     }
 
     let has_fallback = !fallback_items.is_empty();
@@ -498,16 +545,28 @@ fn load_products(path: &Path) -> io::Result<(ProductCatalog, Vec<Box<[u8]>>, u16
 fn load_campaigns(path: &Path) -> io::Result<(CampaignCatalog, Vec<(Key, Key)>)> {
     let data = fs::read(path)?;
     let mut list: Vec<(Key, Key)> = Vec::with_capacity(2048);
-    let mut fast_c = vec![u16::MAX; FAST_C_LEN];
+    let mut fast_items: Vec<(u32, u16)> = Vec::with_capacity(2048);
+    let mut max_fast: isize = -1;
     let mut fallback_items: Vec<(Key, u16)> = Vec::new();
 
     for_each_line(skip_header(&data), |line| {
         if let Some([cid, ch]) = parse_fields::<2>(line) {
             if !cid.is_empty() {
+                assert!(list.len() < u16::MAX as usize);
                 let idx = list.len() as u16;
-                if let Some(num) = try_parse_id_num(cid, b"c_", FAST_C_LEN - 1) {
-                    fast_c[num] = idx;
-                } else {
+                let mut is_fast = false;
+                if cid.len() >= 3 && cid[0] == b'c' && cid[1] == b'_' {
+                    if let Some(num) = parse_dec_suffix(&cid[2..]) {
+                        if num < FAST_C_CAP {
+                            fast_items.push((num as u32, idx));
+                            if (num as isize) > max_fast {
+                                max_fast = num as isize;
+                            }
+                            is_fast = true;
+                        }
+                    }
+                }
+                if !is_fast {
                     fallback_items.push((Key::from_bytes(cid), idx));
                 }
                 list.push((Key::from_bytes(cid), Key::from_bytes(ch)));
@@ -515,12 +574,23 @@ fn load_campaigns(path: &Path) -> io::Result<(CampaignCatalog, Vec<(Key, Key)>)>
         }
     });
 
+    let fast_len = if max_fast >= 0 {
+        (max_fast as usize + 1).min(FAST_C_CAP)
+    } else {
+        0
+    };
+    let mut fast_c = vec![u16::MAX; fast_len];
+    for (num, idx) in fast_items {
+        fast_c[num as usize] = idx;
+    }
+
     let has_fallback = !fallback_items.is_empty();
     let mut fallback = KeyMap::with_capacity(fallback_items.len().max(4));
     for (k, idx) in fallback_items {
         fallback.insert(k, idx);
     }
 
+    assert!(list.len() < u16::MAX as usize);
     list.push((Key::from_bytes(b"organic"), Key::from_bytes(b"organic")));
     Ok((
         CampaignCatalog {
@@ -535,6 +605,7 @@ fn load_campaigns(path: &Path) -> io::Result<(CampaignCatalog, Vec<(Key, Key)>)>
 struct UnionFind {
     id_map: KeyMap<u32>,
     ids: Vec<Key>,
+    hashes: Vec<u64>,
     parent: Vec<u32>,
     min_id: Vec<Key>,
 }
@@ -544,6 +615,7 @@ impl UnionFind {
         Self {
             id_map: KeyMap::with_capacity(expected_nodes.max(64)),
             ids: Vec::with_capacity(expected_nodes),
+            hashes: Vec::with_capacity(expected_nodes),
             parent: Vec::with_capacity(expected_nodes),
             min_id: Vec::with_capacity(expected_nodes),
         }
@@ -556,8 +628,9 @@ impl UnionFind {
             return idx;
         }
         let idx = self.ids.len() as u32;
-        self.id_map.insert(s, idx);
+        self.id_map.insert_with_hash(s, h, idx);
         self.ids.push(s);
+        self.hashes.push(h);
         self.parent.push(idx);
         self.min_id.push(s);
         idx
@@ -622,7 +695,7 @@ fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) 
                         load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read link chunk");
                     for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
-                        if !a.is_empty() && !b.is_empty() {
+                        if !a.is_empty() && !b.is_empty() && a != b {
                             local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
                         }
                     });
@@ -657,9 +730,10 @@ fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) 
         let root = uf.find(idx as u32);
         let min_id = uf.min_id[root as usize];
         if min_id != id {
-            map.insert(id, min_id);
+            let h = uf.hashes[idx];
+            map.insert_with_hash(id, h, min_id);
             if use_bitfilter {
-                let bit = (id.hash64() as usize) & BITFILTER_MASK;
+                let bit = (h as usize) & BITFILTER_MASK;
                 non_canonical[bit >> 6] |= 1u64 << (bit & 63);
             }
         }
@@ -723,14 +797,18 @@ fn read_events_parallel(
     if chunks.is_empty() {
         return Ok(WorkerMatrix::new(Vec::new()));
     }
+    let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
+    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(64);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<RawEvent>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut out: Vec<Vec<RawEvent>> =
-                    (0..NUM_DEDUP_SHARDS).map(|_| Vec::new()).collect();
-                let mut dc = DateCache::new();
+                let mut out: Vec<Vec<RawEvent>> = (0..NUM_DEDUP_SHARDS)
+                    .map(|_| Vec::with_capacity(per_shard_cap))
+                    .collect();
+                let mut dc_ing = DateCache::new();
+                let mut dc_ts = DateCache::new();
                 let mut buf = Vec::new();
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -750,7 +828,7 @@ fn read_events_parallel(
                             if eid.is_empty() {
                                 return;
                             }
-                            let Some(ingest_ts) = dc.parse_ts(ing_b) else {
+                            let Some(ingest_ts) = dc_ing.parse_ts(ing_b) else {
                                 return;
                             };
 
@@ -758,26 +836,33 @@ fn read_events_parallel(
                             let mut price_cat = 0u32;
 
                             if !uid.is_empty() && !pid.is_empty() {
-                                if let Some(ts) = dc.parse_ts(ts_b) {
-                                    if ts >= window_start
-                                        && ts < window_end
-                                        && ingest_ts - ts <= DAY_MS
-                                    {
-                                        match etype {
-                                            b"view" | b"cart" => {
+                                match etype {
+                                    b"view" | b"cart" => {
+                                        if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                            if ts >= window_start
+                                                && ts < window_end
+                                                && ingest_ts - ts <= DAY_MS
+                                            {
                                                 ts_rel = (ts - base_ts) as u32;
                                             }
-                                            b"purchase" => {
-                                                if let Some(p) = parse_price_cents(price_b) {
+                                        }
+                                    }
+                                    b"purchase" => {
+                                        if let Some(p) = parse_price_cents(price_b) {
+                                            if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                                if ts >= window_start
+                                                    && ts < window_end
+                                                    && ingest_ts - ts <= DAY_MS
+                                                {
                                                     ts_rel = (ts - base_ts) as u32;
                                                     let cid = products.get(pid, unknown_cat_id);
                                                     price_cat = (((cid as u32) + 1) << 24)
                                                         | (p as u32);
                                                 }
                                             }
-                                            _ => {}
                                         }
                                     }
+                                    _ => {}
                                 }
                             }
 
@@ -819,13 +904,16 @@ fn read_clicks_parallel(
     if chunks.is_empty() {
         return Ok(WorkerMatrix::new(Vec::new()));
     }
+    let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
+    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<PersonClick>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut out: Vec<Vec<PersonClick>> =
-                    (0..NUM_PERSON_SHARDS).map(|_| Vec::new()).collect();
+                let mut out: Vec<Vec<PersonClick>> = (0..NUM_PERSON_SHARDS)
+                    .map(|_| Vec::with_capacity(per_click_shard_cap))
+                    .collect();
                 let mut dc = DateCache::new();
                 let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                 let mut buf = Vec::new();
@@ -1022,6 +1110,14 @@ fn main() -> io::Result<()> {
     // Phase 2: In-place dedup across [0..ew][sh] -> 16-ahead AoS link prefetch -> scatter to 256 person shards
     let t2 = Instant::now();
     let ew = event_shards.num_workers();
+    let total_raw_events: usize = if ew == 0 {
+        0
+    } else {
+        (0..NUM_DEDUP_SHARDS)
+            .map(|sh| event_shards.shard_len(sh))
+            .sum()
+    };
+    let per_person_shard_cap = (total_raw_events / (ncpu * NUM_PERSON_SHARDS)).max(64);
     let next_shard = AtomicUsize::new(0);
     let pe_workers: Vec<Vec<Vec<PersonEvent>>> = if ew == 0 {
         Vec::new()
@@ -1032,8 +1128,9 @@ fn main() -> io::Result<()> {
                 handles.push(s.spawn(|| {
                     let mut table = DedupTable::new(1 << 14);
                     let mut kept: Vec<RawEvent> = Vec::new();
-                    let mut out: Vec<Vec<PersonEvent>> =
-                        (0..NUM_PERSON_SHARDS).map(|_| Vec::new()).collect();
+                    let mut out: Vec<Vec<PersonEvent>> = (0..NUM_PERSON_SHARDS)
+                        .map(|_| Vec::with_capacity(per_person_shard_cap))
+                        .collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
 
                     loop {
@@ -1052,7 +1149,12 @@ fn main() -> io::Result<()> {
                         }
                         for t in 0..ew {
                             let raw = unsafe { event_shards.get_mut(t, sh) };
-                            for &ev in raw.iter() {
+                            let rlen = raw.len();
+                            for i in 0..rlen {
+                                if cfg.use_prefetch && i + 16 < rlen {
+                                    table.prefetch(raw[i + 16].event_id);
+                                }
+                                let ev = raw[i];
                                 if let Some(pos) = table.get_or_insert(ev, &kept) {
                                     let cur = &mut kept[pos as usize];
                                     if ev.ingest_ts < cur.ingest_ts {
@@ -1188,7 +1290,12 @@ fn main() -> io::Result<()> {
                         bin_counts.fill(0);
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
-                            for ev in evs.iter() {
+                            let elen = evs.len();
+                            for i in 0..elen {
+                                if cfg.use_prefetch && i + 16 < elen {
+                                    pmap.prefetch(evs[i + 16].person_id);
+                                }
+                                let ev = &evs[i];
                                 let (lpid, is_new) =
                                     pmap.get_or_insert(ev.person_id, &mut next_pid);
                                 if is_new {
@@ -1247,7 +1354,12 @@ fn main() -> io::Result<()> {
                     } else {
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
-                            for ev in evs.iter() {
+                            let elen = evs.len();
+                            for i in 0..elen {
+                                if cfg.use_prefetch && i + 16 < elen {
+                                    pmap.prefetch(evs[i + 16].person_id);
+                                }
+                                let ev = &evs[i];
                                 let (lpid, is_new) =
                                     pmap.get_or_insert(ev.person_id, &mut next_pid);
                                 if is_new {
@@ -1293,7 +1405,12 @@ fn main() -> io::Result<()> {
                     clk_tmp.clear();
                     for t in 0..pcw {
                         let clks = unsafe { pc_ref.get_mut(t, sh) };
-                        for clk in clks.iter() {
+                        let clen = clks.len();
+                        for i in 0..clen {
+                            if cfg.use_prefetch && i + 16 < clen {
+                                pmap.prefetch(clks[i + 16].person_id);
+                            }
+                            let clk = &clks[i];
                             if let Some(lpid) = pmap.get(clk.person_id) {
                                 clk_counts[lpid as usize] += 1;
                                 clk_tmp.push((

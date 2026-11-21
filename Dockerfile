@@ -1,10 +1,27 @@
 FROM rust:1.93-alpine3.21 AS builder
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev && rustup component add llvm-tools
 WORKDIR /build
 COPY Cargo.toml ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f"
-RUN cargo build --release
+
+RUN set -eu; \
+    PGO_USE=""; \
+    PROFDATA="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"; \
+    if RUSTFLAGS="" CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8 \
+        cargo build --release --bin synth --target-dir /tmp/synth-target && \
+       /tmp/synth-target/release/synth /tmp/train && \
+       mkdir -p /pgo/raw /tmp/o1 /tmp/o2 && \
+       RUSTFLAGS="--cfg pgo_gen -C target-cpu=x86-64-v3 -C target-feature=+crt-static -Cprofile-generate=/pgo/raw" \
+        cargo build --release --bin shopping-sessions && \
+       LLVM_PROFILE_FILE="/pgo/raw/r_%p_%m.profraw" NCPU=8 /build/target/release/shopping-sessions /tmp/train /tmp/o1 && \
+       LLVM_PROFILE_FILE="/pgo/raw/r_%p_%m.profraw" NCPU=4 /build/target/release/shopping-sessions /tmp/train /tmp/o2 && \
+       "$PROFDATA" merge -o /pgo/merged.profdata /pgo/raw; then \
+        PGO_USE="-Cprofile-use=/pgo/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false"; \
+    fi; \
+    rm -rf /build/target /tmp/train /tmp/o1 /tmp/o2 /tmp/synth-target; \
+    RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f,+crt-static $PGO_USE" \
+        cargo build --release --bin shopping-sessions; \
+    rm -rf /pgo
 
 FROM busybox:1.37-musl
 USER 1000:1000

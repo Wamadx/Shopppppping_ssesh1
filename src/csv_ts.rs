@@ -168,12 +168,11 @@ impl Key {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn hash64(self) -> u64 {
-        let mut x = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^ (x >> 31)
+        let x = self.0 ^ (self.0 >> 32);
+        let r = (x as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (r as u64) ^ ((r >> 64) as u64)
     }
 
     #[inline]
@@ -213,9 +212,12 @@ fn validate_and_unquote<'a, const N: usize>(
     q_cnt: u32,
     out: &mut [&'a [u8]; N],
 ) -> bool {
+    let ptr = buf.as_ptr();
     if q_cnt == 0 {
         for i in 0..N {
-            out[i] = &buf[starts[i]..ends[i]];
+            let s = starts[i];
+            let e = ends[i];
+            out[i] = unsafe { std::slice::from_raw_parts(ptr.add(s), e - s) };
         }
         return true;
     }
@@ -226,12 +228,15 @@ fn validate_and_unquote<'a, const N: usize>(
     for i in 0..N {
         let s = starts[i];
         let e = ends[i];
-        if e - s >= 2 && buf[s] == b'"' && buf[e - 1] == b'"' {
-            wrapped += 2;
-            out[i] = &buf[s + 1..e - 1];
+        let len = e - s;
+        let is_q = if len >= 2 {
+            unsafe { (*ptr.add(s) == b'"') & (*ptr.add(e - 1) == b'"') }
         } else {
-            out[i] = &buf[s..e];
-        }
+            false
+        };
+        let d = is_q as usize;
+        wrapped += (d as u32) << 1;
+        out[i] = unsafe { std::slice::from_raw_parts(ptr.add(s + d), len - (d << 1)) };
     }
     wrapped == q_cnt
 }
@@ -287,6 +292,9 @@ unsafe fn for_each_record_avx2<const N: usize>(
     let mut blk = start;
     while blk < scan_len {
         let p = unsafe { ptr.add(blk) };
+        unsafe {
+            _mm_prefetch(p.add(256) as *const i8, _MM_HINT_T0);
+        }
         let v0 = unsafe { _mm256_loadu_si256(p as *const __m256i) };
         let v1 = unsafe { _mm256_loadu_si256(p.add(32) as *const __m256i) };
 
@@ -313,7 +321,22 @@ unsafe fn for_each_record_avx2<const N: usize>(
             let line_qt = qt & before_nl;
             let line_commas = line_cm.count_ones() as usize;
 
-            if !too_many && fidx + line_commas == N - 1 {
+            if fidx == 0 && !too_many && line_commas == N - 1 {
+                let total_q = q_cnt + line_qt.count_ones();
+                for j in 0..(N - 1) {
+                    let cb_bit = line_cm.trailing_zeros();
+                    let coff = blk + cb_bit as usize;
+                    f_starts[j] = cur_fstart;
+                    f_ends[j] = coff;
+                    cur_fstart = coff + 1;
+                    line_cm &= line_cm - 1;
+                }
+                f_starts[N - 1] = cur_fstart;
+                f_ends[N - 1] = nl_off;
+                if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                    cb(fields);
+                }
+            } else if !too_many && fidx + line_commas == N - 1 {
                 let total_q = q_cnt + line_qt.count_ones();
                 while line_cm != 0 {
                     let cb_bit = line_cm.trailing_zeros();

@@ -2,6 +2,10 @@
 name = "shopping-sessions"
 version = "0.1.0"
 edition = "2024"
+default-run = "shopping-sessions"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgo_gen)'] }
 
 [profile.release]
 opt-level = 3

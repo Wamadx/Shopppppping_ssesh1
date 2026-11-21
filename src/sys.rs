@@ -165,8 +165,15 @@ mod linux_sys {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     pub fn exit_fast() -> ! {
+        #[cfg(pgo_gen)]
+        unsafe {
+            unsafe extern "C" {
+                fn __llvm_profile_write_file() -> i32;
+            }
+            __llvm_profile_write_file();
+        }
         unsafe { _exit(0) }
     }
 }
