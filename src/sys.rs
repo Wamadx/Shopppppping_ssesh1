@@ -182,6 +182,46 @@ mod linux_sys {
 #[global_allocator]
 static ALLOCATOR: linux_sys::HugeBlocks = linux_sys::HugeBlocks;
 
+/// Early writeback of Parquet pages after each row group, unless SHOP_WRITEBACK=0.
+pub fn writeback_enabled() -> bool {
+    !matches!(std::env::var("SHOP_WRITEBACK").as_deref(), Ok("0") | Ok("false"))
+}
+
+/// Starts asynchronous writeback of `f`'s dirty pages (SYNC_FILE_RANGE_WRITE; does not wait).
+pub fn start_writeback(f: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe extern "C" {
+            fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
+        }
+        unsafe {
+            sync_file_range(f.as_raw_fd(), 0, 0, 2);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = f;
+}
+
+/// Experiment E1 (off by default): SHOP_PAD_MB=N leaves N MiB of dirty non-zero bytes in
+/// $SCRATCH_DIR/pad.bin so a scorer run shows whether unflushed output bytes cost wall time.
+pub fn maybe_write_pad() {
+    let mb = std::env::var("SHOP_PAD_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    if mb == 0 {
+        return;
+    }
+    let dir = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
+    if let Ok(mut f) = File::create(std::path::Path::new(&dir).join("pad.bin")) {
+        use std::io::Write;
+        let block = vec![0xA5u8; 1 << 20];
+        for _ in 0..mb {
+            if f.write_all(&block).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 #[inline]
 pub fn fast_exit() -> ! {
     #[cfg(target_os = "linux")]

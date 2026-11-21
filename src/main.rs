@@ -2417,5 +2417,6 @@ fn main() -> io::Result<()> {
         );
     }
 
+    sys::maybe_write_pad();
     sys::fast_exit();
 }

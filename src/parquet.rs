@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::csv_ts::Key;
 
@@ -147,7 +149,12 @@ fn write_schema_element(buf: &mut ThriftBuf, col: &ColSpec<'_>) {
     buf.stop();
 }
 
-fn encode_data_page_header(num_values: i32, payload_len: i32) -> Vec<u8> {
+fn encode_data_page_header(num_values: i32, uncomp: i32, comp: i32) -> Vec<u8> {
+    encode_data_page_header_enc(num_values, uncomp, comp, 0)
+}
+
+#[allow(dead_code)]
+fn encode_data_page_header_plain_legacy(num_values: i32, payload_len: i32) -> Vec<u8> {
     let mut t = ThriftBuf::new();
     let mut last = 0i16;
     t.i32_field(&mut last, 1, 0);
@@ -185,12 +192,14 @@ struct ChunkMeta<'a> {
     dict_page_offset: Option<i64>,
     data_page_offset: i64,
     total_size: i64,
+    total_uncompressed: i64,
     num_values: i64,
 }
 
 struct RowGroupMeta<'a> {
     chunks: Vec<ChunkMeta<'a>>,
     total_byte_size: i64,
+    total_compressed: i64,
     num_rows: i64,
     file_offset: i64,
 }
@@ -238,9 +247,9 @@ fn write_file_metadata<W: Write>(
                 let name = ch.spec.name.as_bytes();
                 t.uvarint(name.len() as u64);
                 t.0.extend_from_slice(name);
-                t.i32_field(&mut mlast, 4, 0);
+                t.i32_field(&mut mlast, 4, if snappy_enabled() { 1 } else { 0 });
                 t.i64_field(&mut mlast, 5, ch.num_values);
-                t.i64_field(&mut mlast, 6, ch.total_size);
+                t.i64_field(&mut mlast, 6, ch.total_uncompressed);
                 t.i64_field(&mut mlast, 7, ch.total_size);
                 t.i64_field(&mut mlast, 9, ch.data_page_offset);
                 if let Some(d) = ch.dict_page_offset {
@@ -253,7 +262,7 @@ fn write_file_metadata<W: Write>(
         t.i64_field(&mut rlast, 2, rg.total_byte_size);
         t.i64_field(&mut rlast, 3, rg.num_rows);
         t.i64_field(&mut rlast, 5, rg.file_offset);
-        t.i64_field(&mut rlast, 6, rg.total_byte_size);
+        t.i64_field(&mut rlast, 6, rg.total_compressed);
         t.i16_field(&mut rlast, 7, rg_idx as i16);
         t.stop();
     }
@@ -267,6 +276,62 @@ fn write_file_metadata<W: Write>(
     Ok(())
 }
 
+static SNAPPY: AtomicU8 = AtomicU8::new(2); // 2 = unset, read SHOP_SNAPPY once
+
+/// Snappy page compression (codec 1) unless SHOP_SNAPPY=0.
+fn snappy_enabled() -> bool {
+    let v = SNAPPY.load(Ordering::Relaxed);
+    if v != 2 {
+        return v == 1;
+    }
+    let on = !matches!(std::env::var("SHOP_SNAPPY").as_deref(), Ok("0") | Ok("false"));
+    SNAPPY.store(on as u8, Ordering::Relaxed);
+    on
+}
+
+thread_local! {
+    static PAGE_SCRATCH: RefCell<(snap::raw::Encoder, Vec<u8>, Vec<u8>)> =
+        RefCell::new((snap::raw::Encoder::new(), Vec::new(), Vec::new()));
+}
+
+/// Writes one page: `make_hdr(uncompressed_len, compressed_len)` followed by the payload formed by
+/// concatenating `parts`, Snappy-compressed when enabled. Returns (bytes written, uncompressed bytes).
+fn emit_page<W: Write>(
+    w: &mut W,
+    parts: &[&[u8]],
+    make_hdr: impl FnOnce(i32, i32) -> Vec<u8>,
+) -> io::Result<(i64, i64)> {
+    let uncomp: usize = parts.iter().map(|p| p.len()).sum();
+    if !snappy_enabled() {
+        let hdr = make_hdr(uncomp as i32, uncomp as i32);
+        w.write_all(&hdr)?;
+        for p in parts {
+            w.write_all(p)?;
+        }
+        return Ok(((hdr.len() + uncomp) as i64, (hdr.len() + uncomp) as i64));
+    }
+    PAGE_SCRATCH.with(|sc| {
+        let (enc, joined, out) = &mut *sc.borrow_mut();
+        let src: &[u8] = if parts.len() == 1 {
+            parts[0]
+        } else {
+            joined.clear();
+            for p in parts {
+                joined.extend_from_slice(p);
+            }
+            joined
+        };
+        out.resize(snap::raw::max_compress_len(src.len()).max(1), 0);
+        let n = enc
+            .compress(src, out)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let hdr = make_hdr(uncomp as i32, n as i32);
+        w.write_all(&hdr)?;
+        w.write_all(&out[..n])?;
+        Ok(((hdr.len() + n) as i64, (hdr.len() + uncomp) as i64))
+    })
+}
+
 fn write_col_page<W: Write>(
     w: &mut W,
     offset: &mut i64,
@@ -274,17 +339,16 @@ fn write_col_page<W: Write>(
     payload: &[u8],
     spec: &'static ColSpec<'static>,
 ) -> io::Result<ChunkMeta<'static>> {
-    let hdr = encode_data_page_header(num_rows as i32, payload.len() as i32);
     let page_offset = *offset;
-    w.write_all(&hdr)?;
-    w.write_all(payload)?;
-    let total_size = (hdr.len() + payload.len()) as i64;
+    let (total_size, total_uncompressed) =
+        emit_page(w, &[payload], |u, c| encode_data_page_header(num_rows as i32, u, c))?;
     *offset += total_size;
     Ok(ChunkMeta {
         spec,
         dict_page_offset: None,
         data_page_offset: page_offset,
         total_size,
+        total_uncompressed,
         num_values: num_rows as i64,
     })
 }
@@ -297,30 +361,28 @@ fn write_opt_col_page<W: Write>(
     vals: &[u8],
     spec: &'static ColSpec<'static>,
 ) -> io::Result<ChunkMeta<'static>> {
-    let payload_len = def_hdr_and_bits.len() + vals.len();
-    let hdr = encode_data_page_header(num_rows as i32, payload_len as i32);
     let page_offset = *offset;
-    w.write_all(&hdr)?;
-    w.write_all(def_hdr_and_bits)?;
-    w.write_all(vals)?;
-    let total_size = (hdr.len() + payload_len) as i64;
+    let (total_size, total_uncompressed) = emit_page(w, &[def_hdr_and_bits, vals], |u, c| {
+        encode_data_page_header(num_rows as i32, u, c)
+    })?;
     *offset += total_size;
     Ok(ChunkMeta {
         spec,
         dict_page_offset: None,
         data_page_offset: page_offset,
         total_size,
+        total_uncompressed,
         num_values: num_rows as i64,
     })
 }
 
 /// PageHeader for a V1 data page with an explicit value encoding.
-fn encode_data_page_header_enc(num_values: i32, payload_len: i32, encoding: i32) -> Vec<u8> {
+fn encode_data_page_header_enc(num_values: i32, uncomp: i32, comp: i32, encoding: i32) -> Vec<u8> {
     let mut t = ThriftBuf::new();
     let mut last = 0i16;
     t.i32_field(&mut last, 1, 0);
-    t.i32_field(&mut last, 2, payload_len);
-    t.i32_field(&mut last, 3, payload_len);
+    t.i32_field(&mut last, 2, uncomp);
+    t.i32_field(&mut last, 3, comp);
     t.field_hdr(&mut last, 5, 12);
     let mut dlast = 0i16;
     t.i32_field(&mut dlast, 1, num_values);
@@ -333,12 +395,12 @@ fn encode_data_page_header_enc(num_values: i32, payload_len: i32, encoding: i32)
 }
 
 /// PageHeader for a dictionary page holding `num_values` PLAIN entries (PLAIN_DICTIONARY).
-fn encode_dict_page_header(num_values: i32, payload_len: i32) -> Vec<u8> {
+fn encode_dict_page_header(num_values: i32, uncomp: i32, comp: i32) -> Vec<u8> {
     let mut t = ThriftBuf::new();
     let mut last = 0i16;
     t.i32_field(&mut last, 1, 2);
-    t.i32_field(&mut last, 2, payload_len);
-    t.i32_field(&mut last, 3, payload_len);
+    t.i32_field(&mut last, 2, uncomp);
+    t.i32_field(&mut last, 3, comp);
     t.field_hdr(&mut last, 7, 12);
     let mut dlast = 0i16;
     t.i32_field(&mut dlast, 1, num_values);
@@ -455,15 +517,14 @@ fn write_int32_col<W: Write>(
         ds.dict_bytes.extend_from_slice(&v.to_le_bytes());
     }
     let dict_off = *offset;
-    let dh = encode_dict_page_header(ds.dict.len() as i32, ds.dict_bytes.len() as i32);
-    w.write_all(&dh)?;
-    w.write_all(&ds.dict_bytes)?;
-    let dict_size = (dh.len() + ds.dict_bytes.len()) as i64;
+    let n_dict = ds.dict.len() as i32;
+    let (dict_size, dict_uncomp) =
+        emit_page(w, &[&ds.dict_bytes], |u, c| encode_dict_page_header(n_dict, u, c))?;
     let data_off = dict_off + dict_size;
-    let ph = encode_data_page_header_enc(num_rows as i32, ds.data.len() as i32, 2);
-    w.write_all(&ph)?;
-    w.write_all(&ds.data)?;
-    let total_size = dict_size + (ph.len() + ds.data.len()) as i64;
+    let (data_size, data_uncomp) = emit_page(w, &[&ds.data], |u, c| {
+        encode_data_page_header_enc(num_rows as i32, u, c, 2)
+    })?;
+    let total_size = dict_size + data_size;
     *offset += total_size;
     ds.clear_slots();
     Ok(ChunkMeta {
@@ -471,6 +532,7 @@ fn write_int32_col<W: Write>(
         dict_page_offset: Some(dict_off),
         data_page_offset: data_off,
         total_size,
+        total_uncompressed: dict_uncomp + data_uncomp,
         num_values: num_rows as i64,
     })
 }
@@ -684,15 +746,22 @@ impl<'a> UserDailyWriter<'a> {
             &USER_SCHEMA[5],
         )?);
 
-        let rg_bytes: i64 = chunks.iter().map(|c| c.total_size).sum();
+        let rg_bytes: i64 = chunks.iter().map(|c| c.total_uncompressed).sum();
+        let rg_comp: i64 = chunks.iter().map(|c| c.total_size).sum();
         self.row_groups.push(RowGroupMeta {
             chunks,
             total_byte_size: rg_bytes,
+            total_compressed: rg_comp,
             num_rows: n as i64,
             file_offset: rg_offset,
         });
         self.total_rows += n as i64;
         self.rg_rows = 0;
+        if crate::sys::writeback_enabled() {
+            let w = self.w.as_mut().unwrap();
+            w.flush()?;
+            crate::sys::start_writeback(w.get_ref());
+        }
         self.user_id_buf.clear();
         self.day_buf.clear();
         self.sessions_buf.clear();
@@ -824,10 +893,12 @@ pub fn write_campaign_daily(
             &CAMPAIGN_SCHEMA[6],
         )?);
 
-        let rg_bytes: i64 = chunks.iter().map(|c| c.total_size).sum();
+        let rg_bytes: i64 = chunks.iter().map(|c| c.total_uncompressed).sum();
+        let rg_comp: i64 = chunks.iter().map(|c| c.total_size).sum();
         row_groups.push(RowGroupMeta {
             chunks,
             total_byte_size: rg_bytes,
+            total_compressed: rg_comp,
             num_rows: chunk.len() as i64,
             file_offset: rg_offset,
         });
