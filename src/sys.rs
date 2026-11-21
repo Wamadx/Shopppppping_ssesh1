@@ -17,6 +17,14 @@ mod linux_sys {
     const MAP_ANONYMOUS: i32 = 0x20;
     const MAP_NORESERVE: i32 = 0x4000;
     const MADV_HUGEPAGE: i32 = 14;
+    const MADV_DONTNEED: i32 = 4;
+
+    // Every huge-aligned mapping, so `exit_fast` can release them in parallel. Slots past
+    // MAX_REGIONS are simply not tracked (the kernel still reclaims them at exit).
+    const MAX_REGIONS: usize = 16384;
+    static REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static REGION_ADDR: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
+    static REGION_LEN: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
 
     unsafe extern "C" {
         fn mmap(
@@ -62,6 +70,11 @@ mod linux_sys {
                 munmap(tail_start as *mut u8, tail);
             }
             madvise(aligned_addr as *mut u8, len, MADV_HUGEPAGE);
+        }
+        let slot = REGION_COUNT.fetch_add(1, Ordering::Relaxed);
+        if slot < MAX_REGIONS {
+            REGION_LEN[slot].store(len, Ordering::Relaxed);
+            REGION_ADDR[slot].store(aligned_addr, Ordering::Release);
         }
         (aligned_addr as *mut u8, len)
     }
@@ -182,6 +195,54 @@ mod linux_sys {
         }
     }
 
+    /// Drops the pages of every tracked mapping with MADV_DONTNEED, split across `threads`
+    /// threads. Exit otherwise frees all of them on one core inside exit_mmap, which is still
+    /// inside the timed window. Only called once all output is written and no other thread
+    /// touches these mappings; MADV_DONTNEED holds mmap_lock for read, so the threads run in
+    /// parallel, and nothing is unmapped.
+    fn release_parallel(threads: usize) {
+        let n = REGION_COUNT.load(Ordering::Acquire).min(MAX_REGIONS);
+        let mut regions: Vec<(usize, usize)> = Vec::with_capacity(n);
+        let mut total = 0usize;
+        for i in 0..n {
+            let a = REGION_ADDR[i].load(Ordering::Acquire);
+            let l = REGION_LEN[i].load(Ordering::Relaxed);
+            if a != 0 && l != 0 {
+                regions.push((a, l));
+                total += l;
+            }
+        }
+        if threads < 2 || total < (256 << 20) {
+            return;
+        }
+        // Cut the regions into `threads` contiguous shares of ~equal bytes, on 2 MiB boundaries.
+        let share = ((total / threads) + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+        let mut parts: Vec<Vec<(usize, usize)>> = vec![Vec::new(); threads];
+        let (mut t, mut used) = (0usize, 0usize);
+        for &(a, l) in &regions {
+            let mut off = 0;
+            while off < l {
+                let take = if t + 1 == threads { l - off } else { (l - off).min(share - used) };
+                parts[t].push((a + off, take));
+                off += take;
+                used += take;
+                if used == share && t + 1 < threads {
+                    t += 1;
+                    used = 0;
+                }
+            }
+        }
+        std::thread::scope(|s| {
+            for part in &parts {
+                s.spawn(move || {
+                    for &(a, l) in part {
+                        unsafe { madvise(a as *mut u8, l, MADV_DONTNEED) };
+                    }
+                });
+            }
+        });
+    }
+
     #[inline(never)]
     pub fn exit_fast() -> ! {
         #[cfg(pgo_gen)]
@@ -190,6 +251,15 @@ mod linux_sys {
                 fn __llvm_profile_write_file() -> i32;
             }
             __llvm_profile_write_file();
+        }
+        if !matches!(std::env::var("SHOP_EXIT_RELEASE").as_deref(), Ok("0") | Ok("false")) {
+            let threads = std::env::var("NCPU")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from))
+                .min(64);
+            release_parallel(threads);
         }
         unsafe { _exit(0) }
     }
