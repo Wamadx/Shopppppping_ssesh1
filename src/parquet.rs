@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::csv_ts::Key;
+use crate::snappy::Compressor;
 
 pub struct CampaignDailyRow {
     pub campaign_id_idx: u16,
@@ -290,8 +291,8 @@ fn snappy_enabled() -> bool {
 }
 
 thread_local! {
-    static PAGE_SCRATCH: RefCell<(snap::raw::Encoder, Vec<u8>, Vec<u8>)> =
-        RefCell::new((snap::raw::Encoder::new(), Vec::new(), Vec::new()));
+    static PAGE_SCRATCH: RefCell<(Compressor, Vec<u8>, Vec<u8>)> =
+        RefCell::new((Compressor::new(), Vec::new(), Vec::new()));
 }
 
 /// Writes one page: `make_hdr(uncompressed_len, compressed_len)` followed by the payload formed by
@@ -321,10 +322,9 @@ fn emit_page<W: Write>(
             }
             joined
         };
-        out.resize(snap::raw::max_compress_len(src.len()).max(1), 0);
-        let n = enc
-            .compress(src, out)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        out.clear();
+        enc.compress(src, out);
+        let n = out.len();
         let hdr = make_hdr(uncomp as i32, n as i32);
         w.write_all(&hdr)?;
         w.write_all(&out[..n])?;

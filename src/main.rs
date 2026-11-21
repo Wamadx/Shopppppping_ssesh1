@@ -1,5 +1,6 @@
 mod csv_ts;
 mod parquet;
+mod snappy;
 mod sys;
 
 use std::cell::UnsafeCell;
