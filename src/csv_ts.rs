@@ -569,12 +569,18 @@ struct DateEntry {
 }
 
 pub struct DateCache {
+    last_k0: u64,
+    last_k1: u16,
+    last_day_ms: i64,
     entries: [DateEntry; 64],
 }
 
 impl DateCache {
     pub fn new() -> Self {
         Self {
+            last_k0: u64::MAX,
+            last_k1: u16::MAX,
+            last_day_ms: i64::MIN,
             entries: [DateEntry {
                 k0: u64::MAX,
                 k1: u16::MAX,
@@ -589,21 +595,36 @@ impl DateCache {
         if len == 20 && s[19] == b'Z' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
             let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
             let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
-            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> 58) as usize;
-            let ent = &self.entries[slot];
-            let day_ms = if ent.k0 == k0 && ent.k1 == k1 {
-                if ent.day_ms == i64::MIN {
+            let day_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
+                if self.last_day_ms == i64::MIN {
                     return None;
                 }
-                ent.day_ms
+                self.last_day_ms
             } else {
-                let d = parse_date_10(&s[0..10]);
-                self.entries[slot] = DateEntry {
-                    k0,
-                    k1,
-                    day_ms: d.unwrap_or(i64::MIN),
+                let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> 58) as usize;
+                let ent = &self.entries[slot];
+                let d_ms = if ent.k0 == k0 && ent.k1 == k1 {
+                    if ent.day_ms == i64::MIN {
+                        return None;
+                    }
+                    ent.day_ms
+                } else {
+                    let d = parse_date_10(&s[0..10]);
+                    let val = d.unwrap_or(i64::MIN);
+                    self.entries[slot] = DateEntry {
+                        k0,
+                        k1,
+                        day_ms: val,
+                    };
+                    val
                 };
-                d?
+                self.last_k0 = k0;
+                self.last_k1 = k1;
+                self.last_day_ms = d_ms;
+                if d_ms == i64::MIN {
+                    return None;
+                }
+                d_ms
             };
             let hms_ms = parse_hms_swar(&s[11..19])?;
             return Some(day_ms + hms_ms);

@@ -3,7 +3,6 @@ mod parquet;
 mod sys;
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -29,7 +28,7 @@ const DEDUP_SHIFT: u32 = 55; // 64 - 9
 const NUM_PERSON_SHARDS: usize = 256;
 const PERSON_SHIFT: u32 = 56; // 64 - 8
 
-const BITFILTER_BITS: usize = 1 << 24; // 16,777,216 bits = 2 MiB
+const BITFILTER_BITS: usize = 1 << 24; // 2 MiB
 const BITFILTER_MASK: usize = BITFILTER_BITS - 1;
 
 #[derive(Clone, Copy)]
@@ -37,7 +36,6 @@ struct Config {
     chunk_bytes: usize,
     use_bitfilter: bool,
     use_sortless: bool,
-    use_swc: bool,
     timing: bool,
 }
 
@@ -54,12 +52,11 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&k| k >= 64)
-            .unwrap_or(256);
+            .unwrap_or(512);
         Self {
             chunk_bytes: chunk_kb * 1024,
-            use_bitfilter: env_bool("SHOP_BITFILTER", false),
-            use_sortless: env_bool("SHOP_SORTLESS", true),
-            use_swc: env_bool("SHOP_SWC", false),
+            use_bitfilter: env_bool("SHOP_BITFILTER", true),
+            use_sortless: env_bool("SHOP_SORTLESS", false),
             timing: env_bool("TIMING", false),
         }
     }
@@ -111,61 +108,9 @@ impl<T> WorkerMatrix<T> {
     }
 }
 
-/// Cache-friendly software write-combining scatter buffer staging K=4 items per shard.
-struct SwcScatter<T: Copy + Default, const SHARDS: usize> {
-    stage: Vec<[T; 4]>,
-    lens: [u8; SHARDS],
-    out: Vec<Vec<T>>,
-    use_swc: bool,
-}
-
-impl<T: Copy + Default, const SHARDS: usize> SwcScatter<T, SHARDS> {
-    fn new(use_swc: bool) -> Self {
-        Self {
-            stage: if use_swc {
-                vec![[T::default(); 4]; SHARDS]
-            } else {
-                Vec::new()
-            },
-            lens: [0; SHARDS],
-            out: (0..SHARDS).map(|_| Vec::new()).collect(),
-            use_swc,
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, shard: usize, item: T) {
-        if !self.use_swc {
-            self.out[shard].push(item);
-            return;
-        }
-        let n = self.lens[shard] as usize;
-        self.stage[shard][n] = item;
-        if n == 3 {
-            self.out[shard].extend_from_slice(&self.stage[shard]);
-            self.lens[shard] = 0;
-        } else {
-            self.lens[shard] = (n + 1) as u8;
-        }
-    }
-
-    fn finish(mut self) -> Vec<Vec<T>> {
-        if self.use_swc {
-            for sh in 0..SHARDS {
-                let n = self.lens[sh] as usize;
-                if n > 0 {
-                    self.out[sh].extend_from_slice(&self.stage[sh][..n]);
-                }
-            }
-        }
-        self.out
-    }
-}
-
+/// Single-cache-line AoS open-addressing hash map (`key == 0` empty sentinel).
 struct KeyMap<V: Copy + Default> {
-    keys: Vec<u64>,
-    vals: Vec<V>,
-    occupied: Vec<u8>,
+    entries: Vec<(u64, V)>,
     mask: usize,
 }
 
@@ -173,9 +118,7 @@ impl<V: Copy + Default> KeyMap<V> {
     fn with_capacity(expected: usize) -> Self {
         let cap = (expected.saturating_mul(2).max(16)).next_power_of_two();
         Self {
-            keys: vec![0; cap],
-            vals: vec![V::default(); cap],
-            occupied: vec![0; cap],
+            entries: vec![(0u64, V::default()); cap],
             mask: cap - 1,
         }
     }
@@ -185,14 +128,9 @@ impl<V: Copy + Default> KeyMap<V> {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if self.occupied[idx] == 0 {
-                self.occupied[idx] = 1;
-                self.keys[idx] = k;
-                self.vals[idx] = val;
-                return;
-            }
-            if self.keys[idx] == k {
-                self.vals[idx] = val;
+            let e = &mut self.entries[idx];
+            if e.0 == 0 || e.0 == k {
+                *e = (k, val);
                 return;
             }
             idx = (idx + 1) & self.mask;
@@ -200,15 +138,22 @@ impl<V: Copy + Default> KeyMap<V> {
     }
 
     #[inline(always)]
+    fn prefetch_with_hash(&self, h: u64) {
+        let idx = (h as usize) & self.mask;
+        prefetch_ro(self.entries.as_ptr().wrapping_add(idx));
+    }
+
+    #[inline(always)]
     fn get_with_hash(&self, key: Key, h: u64) -> Option<V> {
         let k = key.0;
         let mut idx = (h as usize) & self.mask;
         loop {
-            if self.occupied[idx] == 0 {
+            let e = unsafe { *self.entries.get_unchecked(idx) };
+            if e.0 == 0 {
                 return None;
             }
-            if self.keys[idx] == k {
-                return Some(self.vals[idx]);
+            if e.0 == k {
+                return Some(e.1);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -234,9 +179,7 @@ impl LinkTable {
             let bit = (h as usize) & BITFILTER_MASK;
             prefetch_ro(self.non_canonical.as_ptr().wrapping_add(bit >> 6));
         } else {
-            let idx = (h as usize) & self.map.mask;
-            prefetch_ro(self.map.keys.as_ptr().wrapping_add(idx));
-            prefetch_ro(self.map.occupied.as_ptr().wrapping_add(idx));
+            self.map.prefetch_with_hash(h);
         }
     }
 
@@ -261,12 +204,75 @@ impl LinkTable {
     }
 }
 
-/// Packed 8-byte slot dedup table (`(tag32 << 32) | idx32`) with generation stamps.
-/// Indexed by low bits of `hash64` (independent of top 9 shard bits).
+/// Parses unsigned decimal ID suffix without leading zeros (`p123` -> `Some(123)`, `p01` -> `None`).
+#[inline(always)]
+fn try_parse_id_num(s: &[u8], prefix: &[u8], max_val: usize) -> Option<usize> {
+    if !s.starts_with(prefix) {
+        return None;
+    }
+    let rest = &s[prefix.len()..];
+    let len = rest.len();
+    if len == 0 || len > 6 {
+        return None;
+    }
+    if len > 1 && rest[0] == b'0' {
+        return None;
+    }
+    let mut val = 0usize;
+    for &b in rest {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + ((b - b'0') as usize);
+    }
+    if val <= max_val { Some(val) } else { None }
+}
+
+const FAST_P_LEN: usize = 131_072;
+struct ProductCatalog {
+    fast_p: Vec<u16>,
+    fallback: KeyMap<u16>,
+    has_fallback: bool,
+}
+
+impl ProductCatalog {
+    #[inline(always)]
+    fn get(&self, pid: &[u8], unknown_cat_id: u16) -> u16 {
+        if let Some(num) = try_parse_id_num(pid, b"p", FAST_P_LEN - 1) {
+            let c = unsafe { *self.fast_p.get_unchecked(num) };
+            return if c != u16::MAX { c } else { unknown_cat_id };
+        }
+        if self.has_fallback {
+            return self.fallback.get(Key::from_bytes(pid)).unwrap_or(unknown_cat_id);
+        }
+        unknown_cat_id
+    }
+}
+
+const FAST_C_LEN: usize = 16_384;
+struct CampaignCatalog {
+    fast_c: Vec<u16>,
+    fallback: KeyMap<u16>,
+    has_fallback: bool,
+}
+
+impl CampaignCatalog {
+    #[inline(always)]
+    fn get(&self, cid: &[u8]) -> Option<u16> {
+        if let Some(num) = try_parse_id_num(cid, b"c_", FAST_C_LEN - 1) {
+            let c = unsafe { *self.fast_c.get_unchecked(num) };
+            return if c != u16::MAX { Some(c) } else { None };
+        }
+        if self.has_fallback {
+            return self.fallback.get(Key::from_bytes(cid));
+        }
+        None
+    }
+}
+
+/// Single-array L2-resident dedup table: `slot = (tag32 << 32) | ((pos + 1) as u64)`, `0` = empty.
 struct DedupTable {
     slots: Vec<u64>,
-    stamps: Vec<u16>,
-    epoch: u16,
     mask: usize,
 }
 
@@ -275,24 +281,17 @@ impl DedupTable {
         let cap = initial_pow2.next_power_of_two().max(1024);
         Self {
             slots: vec![0; cap],
-            stamps: vec![0; cap],
-            epoch: 1,
             mask: cap - 1,
         }
     }
 
     fn reset(&mut self, needed: usize) {
-        if needed.saturating_mul(2) >= self.slots.len() {
-            let new_cap = (needed.saturating_mul(2)).next_power_of_two();
-            self.slots.resize(new_cap, 0);
-            self.stamps.resize(new_cap, 0);
-            self.mask = new_cap - 1;
+        let cap = needed.saturating_mul(2).max(1024).next_power_of_two();
+        if cap > self.slots.len() {
+            self.slots.resize(cap, 0);
         }
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.stamps.fill(0);
-            self.epoch = 1;
-        }
+        self.slots[..cap].fill(0);
+        self.mask = cap - 1;
     }
 
     #[inline(always)]
@@ -301,16 +300,17 @@ impl DedupTable {
         let tag = (h >> 23) & 0xFFFF_FFFF;
         let mut idx = (h as usize) & self.mask;
         loop {
-            if self.stamps[idx] != self.epoch {
-                self.stamps[idx] = self.epoch;
-                self.slots[idx] = (tag << 32) | (kept.len() as u64);
+            let slot_val = unsafe { *self.slots.get_unchecked(idx) };
+            if slot_val == 0 {
+                unsafe {
+                    *self.slots.get_unchecked_mut(idx) = (tag << 32) | ((kept.len() as u64) + 1);
+                }
                 return None;
             }
-            let slot_val = self.slots[idx];
             if (slot_val >> 32) == tag {
-                let pos = slot_val as u32;
-                if kept[pos as usize].event_id == ev.event_id {
-                    return Some(pos);
+                let pos = ((slot_val as u32) - 1) as usize;
+                if unsafe { kept.get_unchecked(pos) }.event_id == ev.event_id {
+                    return Some(pos as u32);
                 }
             }
             idx = (idx + 1) & self.mask;
@@ -319,8 +319,7 @@ impl DedupTable {
 }
 
 struct LocalPersonMap {
-    keys: Vec<u64>,
-    vals: Vec<u32>,
+    entries: Vec<(u64, u32)>,
     stamps: Vec<u16>,
     epoch: u16,
     mask: usize,
@@ -330,8 +329,7 @@ impl LocalPersonMap {
     fn new(initial_pow2: usize) -> Self {
         let cap = initial_pow2.next_power_of_two().max(1024);
         Self {
-            keys: vec![0; cap],
-            vals: vec![0; cap],
+            entries: vec![(0, 0); cap],
             stamps: vec![0; cap],
             epoch: 1,
             mask: cap - 1,
@@ -339,13 +337,12 @@ impl LocalPersonMap {
     }
 
     fn reset(&mut self, needed: usize) {
-        if needed.saturating_mul(2) >= self.keys.len() {
-            let new_cap = (needed.saturating_mul(2)).next_power_of_two();
-            self.keys.resize(new_cap, 0);
-            self.vals.resize(new_cap, 0);
-            self.stamps.resize(new_cap, 0);
-            self.mask = new_cap - 1;
+        let cap = needed.saturating_mul(2).max(1024).next_power_of_two();
+        if cap > self.entries.len() {
+            self.entries.resize(cap, (0, 0));
+            self.stamps.resize(cap, 0);
         }
+        self.mask = cap - 1;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.stamps.fill(0);
@@ -358,16 +355,18 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if self.stamps[idx] != self.epoch {
+            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
                 let id = *next_id;
                 *next_id = id + 1;
-                self.stamps[idx] = self.epoch;
-                self.keys[idx] = k;
-                self.vals[idx] = id;
+                unsafe {
+                    *self.stamps.get_unchecked_mut(idx) = self.epoch;
+                    *self.entries.get_unchecked_mut(idx) = (k, id);
+                }
                 return (id, true);
             }
-            if self.keys[idx] == k {
-                return (self.vals[idx], false);
+            let e = unsafe { *self.entries.get_unchecked(idx) };
+            if e.0 == k {
+                return (e.1, false);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -378,11 +377,12 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if self.stamps[idx] != self.epoch {
+            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
                 return None;
             }
-            if self.keys[idx] == k {
-                return Some(self.vals[idx]);
+            let e = unsafe { *self.entries.get_unchecked(idx) };
+            if e.0 == k {
+                return Some(e.1);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -426,57 +426,110 @@ fn extract_json_str<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     Some(&after[..q2])
 }
 
-fn load_products(path: &Path) -> io::Result<(KeyMap<u16>, Vec<Box<[u8]>>, u16)> {
+fn load_products(path: &Path) -> io::Result<(ProductCatalog, Vec<Box<[u8]>>, u16)> {
     let data = fs::read(path)?;
-    let mut pairs: Vec<(Key, Vec<u8>)> = Vec::new();
-    let mut cat_set: HashMap<Vec<u8>, ()> = HashMap::new();
-    cat_set.insert(b"unknown".to_vec(), ());
+    let mut raw_cats: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+    let mut raw_pairs: Vec<(&[u8], usize)> = Vec::with_capacity(65_536);
 
-    for_each_line(skip_header(&data), |line| {
+    let body = skip_header(&data);
+    let mut start = 0usize;
+    while start < body.len() {
+        let end = body[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(body.len(), |r| start + r);
+        let line = &body[start..end];
+        start = end + 1;
         if let Some([pid, cat]) = parse_fields::<2>(line) {
             if !pid.is_empty() {
-                let cvec = cat.to_vec();
-                cat_set.entry(cvec.clone()).or_insert(());
-                pairs.push((Key::from_bytes(pid), cvec));
+                let raw_cid = match raw_cats.iter().position(|c| c.as_slice() == cat) {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = raw_cats.len();
+                        raw_cats.push(cat.to_vec());
+                        idx
+                    }
+                };
+                raw_pairs.push((pid, raw_cid));
             }
         }
-    });
-
-    let mut categories: Vec<Box<[u8]>> =
-        cat_set.into_keys().map(|v| v.into_boxed_slice()).collect();
-    categories.sort();
-    assert!(categories.len() <= 255);
-
-    let mut cat_to_id: HashMap<&[u8], u16> = HashMap::with_capacity(categories.len());
-    for (i, c) in categories.iter().enumerate() {
-        cat_to_id.insert(c, i as u16);
     }
-    let unknown_id = *cat_to_id.get(b"unknown".as_slice()).unwrap();
 
-    let mut map = KeyMap::with_capacity(pairs.len().max(16));
-    for (pid, cvec) in pairs {
-        let cid = cat_to_id[cvec.as_slice()];
-        map.insert(pid, cid);
+    assert!(raw_cats.len() <= 255);
+    let mut order: Vec<usize> = (0..raw_cats.len()).collect();
+    order.sort_by(|&a, &b| raw_cats[a].cmp(&raw_cats[b]));
+
+    let mut categories: Vec<Box<[u8]>> = Vec::with_capacity(raw_cats.len());
+    let mut remap = [0u16; 256];
+    for (sorted_id, &orig_id) in order.iter().enumerate() {
+        remap[orig_id] = sorted_id as u16;
+        categories.push(raw_cats[orig_id].clone().into_boxed_slice());
     }
-    Ok((map, categories, unknown_id))
+    let unknown_id = remap[0];
+
+    let mut fast_p = vec![u16::MAX; FAST_P_LEN];
+    let mut fallback_items: Vec<(Key, u16)> = Vec::new();
+    for (pid, raw_cid) in raw_pairs {
+        let cid = remap[raw_cid];
+        if let Some(num) = try_parse_id_num(pid, b"p", FAST_P_LEN - 1) {
+            fast_p[num] = cid;
+        } else {
+            fallback_items.push((Key::from_bytes(pid), cid));
+        }
+    }
+
+    let has_fallback = !fallback_items.is_empty();
+    let mut fallback = KeyMap::with_capacity(fallback_items.len().max(4));
+    for (k, cid) in fallback_items {
+        fallback.insert(k, cid);
+    }
+
+    Ok((
+        ProductCatalog {
+            fast_p,
+            fallback,
+            has_fallback,
+        },
+        categories,
+        unknown_id,
+    ))
 }
 
-fn load_campaigns(path: &Path) -> io::Result<(KeyMap<u16>, Vec<(Key, Key)>)> {
+fn load_campaigns(path: &Path) -> io::Result<(CampaignCatalog, Vec<(Key, Key)>)> {
     let data = fs::read(path)?;
-    let mut list: Vec<(Key, Key)> = Vec::new();
+    let mut list: Vec<(Key, Key)> = Vec::with_capacity(2048);
+    let mut fast_c = vec![u16::MAX; FAST_C_LEN];
+    let mut fallback_items: Vec<(Key, u16)> = Vec::new();
+
     for_each_line(skip_header(&data), |line| {
         if let Some([cid, ch]) = parse_fields::<2>(line) {
             if !cid.is_empty() {
+                let idx = list.len() as u16;
+                if let Some(num) = try_parse_id_num(cid, b"c_", FAST_C_LEN - 1) {
+                    fast_c[num] = idx;
+                } else {
+                    fallback_items.push((Key::from_bytes(cid), idx));
+                }
                 list.push((Key::from_bytes(cid), Key::from_bytes(ch)));
             }
         }
     });
-    let mut map = KeyMap::with_capacity(list.len().max(16));
-    for (i, &(cid, _)) in list.iter().enumerate() {
-        map.insert(cid, i as u16);
+
+    let has_fallback = !fallback_items.is_empty();
+    let mut fallback = KeyMap::with_capacity(fallback_items.len().max(4));
+    for (k, idx) in fallback_items {
+        fallback.insert(k, idx);
     }
+
     list.push((Key::from_bytes(b"organic"), Key::from_bytes(b"organic")));
-    Ok((map, list))
+    Ok((
+        CampaignCatalog {
+            fast_c,
+            fallback,
+            has_fallback,
+        },
+        list,
+    ))
 }
 
 struct UnionFind {
@@ -663,7 +716,7 @@ fn read_events_parallel(
     base_ts: i64,
     window_start: i64,
     window_end: i64,
-    products: &KeyMap<u16>,
+    products: &ProductCatalog,
     unknown_cat_id: u16,
 ) -> io::Result<WorkerMatrix<RawEvent>> {
     let (files, chunks) = plan_file_chunks(paths, cfg.chunk_bytes)?;
@@ -675,7 +728,8 @@ fn read_events_parallel(
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut swc: SwcScatter<RawEvent, NUM_DEDUP_SHARDS> = SwcScatter::new(cfg.use_swc);
+                let mut out: Vec<Vec<RawEvent>> =
+                    (0..NUM_DEDUP_SHARDS).map(|_| Vec::new()).collect();
                 let mut dc = DateCache::new();
                 let mut buf = Vec::new();
                 loop {
@@ -716,9 +770,7 @@ fn read_events_parallel(
                                             b"purchase" => {
                                                 if let Some(p) = parse_price_cents(price_b) {
                                                     ts_rel = (ts - base_ts) as u32;
-                                                    let cid = products
-                                                        .get(Key::from_bytes(pid))
-                                                        .unwrap_or(unknown_cat_id);
+                                                    let cid = products.get(pid, unknown_cat_id);
                                                     price_cat = (((cid as u32) + 1) << 24)
                                                         | (p as u32);
                                                 }
@@ -736,20 +788,17 @@ fn read_events_parallel(
                                 Key::EMPTY
                             };
                             let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
-                            swc.push(
-                                shard,
-                                RawEvent {
-                                    event_id,
-                                    user_id,
-                                    ingest_ts,
-                                    ts_rel,
-                                    price_cat,
-                                },
-                            );
+                            out[shard].push(RawEvent {
+                                event_id,
+                                user_id,
+                                ingest_ts,
+                                ts_rel,
+                                price_cat,
+                            });
                         },
                     );
                 }
-                swc.finish()
+                out
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -763,7 +812,7 @@ fn read_clicks_parallel(
     cfg: Config,
     base_ts: i64,
     window_end: i64,
-    campaigns: &KeyMap<u16>,
+    campaigns: &CampaignCatalog,
     links: &LinkTable,
 ) -> io::Result<WorkerMatrix<PersonClick>> {
     let (files, chunks) = plan_file_chunks(paths, cfg.chunk_bytes)?;
@@ -775,8 +824,8 @@ fn read_clicks_parallel(
         let mut handles = Vec::with_capacity(ncpu);
         for _ in 0..ncpu {
             handles.push(s.spawn(|| {
-                let mut swc: SwcScatter<PersonClick, NUM_PERSON_SHARDS> =
-                    SwcScatter::new(cfg.use_swc);
+                let mut out: Vec<Vec<PersonClick>> =
+                    (0..NUM_PERSON_SHARDS).map(|_| Vec::new()).collect();
                 let mut dc = DateCache::new();
                 let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                 let mut buf = Vec::new();
@@ -789,35 +838,38 @@ fn read_clicks_parallel(
                     let (start, own_end, scan_len) =
                         load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read click chunk");
-                    for_each_record_simd::<4>(&buf, start, own_end, scan_len, |[clid, uid, camp_b, ts_b]| {
-                        if clid.is_empty() || uid.is_empty() {
-                            return;
-                        }
-                        let Some(campaign_idx) = campaigns.get(Key::from_bytes(camp_b)) else {
-                            return;
-                        };
-                        let Some(ts) = dc.parse_ts(ts_b) else {
-                            return;
-                        };
-                        if ts < base_ts || ts >= window_end {
-                            return;
-                        }
-                        let raw_uid = Key::from_bytes(uid);
-                        let person_id = links.resolve(raw_uid, &mut link_cache);
-                        let click_id = Key::from_bytes(clid);
-                        let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
-                        swc.push(
-                            shard,
-                            PersonClick {
+                    for_each_record_simd::<4>(
+                        &buf,
+                        start,
+                        own_end,
+                        scan_len,
+                        |[clid, uid, camp_b, ts_b]| {
+                            if clid.is_empty() || uid.is_empty() {
+                                return;
+                            }
+                            let Some(campaign_idx) = campaigns.get(camp_b) else {
+                                return;
+                            };
+                            let Some(ts) = dc.parse_ts(ts_b) else {
+                                return;
+                            };
+                            if ts < base_ts || ts >= window_end {
+                                return;
+                            }
+                            let raw_uid = Key::from_bytes(uid);
+                            let person_id = links.resolve(raw_uid, &mut link_cache);
+                            let click_id = Key::from_bytes(clid);
+                            let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                            out[shard].push(PersonClick {
                                 person_id,
                                 click_id,
                                 ts_rel: (ts - base_ts) as u32,
                                 campaign_idx: campaign_idx as u32,
-                            },
-                        );
-                    });
+                            });
+                        },
+                    );
                 }
-                swc.finish()
+                out
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -967,7 +1019,7 @@ fn main() -> io::Result<()> {
     )?;
     let ms_events_io = t1.elapsed().as_secs_f64() * 1000.0;
 
-    // Phase 2: In-place dedup across [0..ew][sh] -> resolve links -> scatter to 256 person shards
+    // Phase 2: In-place dedup across [0..ew][sh] -> 16-ahead AoS link prefetch -> scatter to 256 person shards
     let t2 = Instant::now();
     let ew = event_shards.num_workers();
     let next_shard = AtomicUsize::new(0);
@@ -980,8 +1032,8 @@ fn main() -> io::Result<()> {
                 handles.push(s.spawn(|| {
                     let mut table = DedupTable::new(1 << 14);
                     let mut kept: Vec<RawEvent> = Vec::new();
-                    let mut swc: SwcScatter<PersonEvent, NUM_PERSON_SHARDS> =
-                        SwcScatter::new(cfg.use_swc);
+                    let mut out: Vec<Vec<PersonEvent>> =
+                        (0..NUM_PERSON_SHARDS).map(|_| Vec::new()).collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
 
                     loop {
@@ -1024,17 +1076,14 @@ fn main() -> io::Result<()> {
                                 let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
                                 let packed_ev =
                                     ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
-                                swc.push(
-                                    psh,
-                                    PersonEvent {
-                                        person_id,
-                                        packed_ev,
-                                    },
-                                );
+                                out[psh].push(PersonEvent {
+                                    person_id,
+                                    packed_ev,
+                                });
                             }
                         }
                     }
-                    swc.finish()
+                    out
                 }));
             }
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1238,7 +1287,7 @@ fn main() -> io::Result<()> {
 
                     let num_people = p_ids.len();
 
-                    // Filter and counting-sort clicks strictly for people with events
+                    // Filter and counting-sort clicks strictly for people with surviving events
                     clk_counts.clear();
                     clk_counts.resize(num_people, 0);
                     clk_tmp.clear();

@@ -299,11 +299,10 @@ pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -
     let initial_end = (chunk.c_end + SLOP as u64).min(f.len);
     let need = (initial_end - read_start) as usize;
 
-    buf.clear();
-    if buf.capacity() < need + SIMD_PAD + 1 {
-        buf.reserve(need + SIMD_PAD + 1 - buf.capacity());
+    // Avoid zeroing the entire chunk buffer on every iteration; only tail SIMD slack is zeroed below.
+    if buf.len() < need + SIMD_PAD + 1 {
+        buf.resize(need + SIMD_PAD + 1, 0);
     }
-    buf.resize(need, 0);
     let mut valid = read_at_all(&f.file, read_start, &mut buf[..need])?;
 
     let own_end = (chunk.c_end - read_start) as usize;
@@ -337,7 +336,9 @@ pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -
                             let skip_to = (next_start - read_start) as usize;
                             let extra_end = (next_start + SLOP as u64).min(f.len);
                             let total_len = (extra_end - read_start) as usize;
-                            buf.resize(total_len, 0);
+                            if buf.len() < total_len + SIMD_PAD + 1 {
+                                buf.resize(total_len + SIMD_PAD + 1, 0);
+                            }
                             let tail_start_buf = skip_to;
                             let tail_in_tmp = n - (rel + 1);
                             buf[tail_start_buf..tail_start_buf + tail_in_tmp]
@@ -377,7 +378,9 @@ pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -
         while read_start + (valid as u64) < f.len {
             let old_valid = valid;
             let new_len = ((old_valid + ext) as u64).min(f.len - read_start) as usize;
-            buf.resize(new_len, 0);
+            if buf.len() < new_len + SIMD_PAD + 1 {
+                buf.resize(new_len + SIMD_PAD + 1, 0);
+            }
             let n = read_at_all(&f.file, read_start + old_valid as u64, &mut buf[old_valid..new_len])?;
             valid = old_valid + n;
             if n == 0 || buf[old_valid..valid].contains(&b'\n') {
@@ -389,12 +392,15 @@ pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -
 
     let mut scan_len = valid;
     if read_start + (valid as u64) == f.len && valid > scan_from && buf[valid - 1] != b'\n' {
-        buf.resize(valid + 1 + SIMD_PAD, 0);
+        if buf.len() < valid + 1 + SIMD_PAD {
+            buf.resize(valid + 1 + SIMD_PAD, 0);
+        }
         buf[valid] = b'\n';
         scan_len = valid + 1;
-    } else {
+    } else if buf.len() < valid + SIMD_PAD {
         buf.resize(valid + SIMD_PAD, 0);
     }
+    buf[scan_len..scan_len + SIMD_PAD].fill(0);
 
     if scan_from > 0 && buf[scan_from - 1] != b'\n' && chunk.c_start > f.data_start {
         scan_from = scan_from.min(valid);
