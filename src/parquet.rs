@@ -279,13 +279,13 @@ fn write_file_metadata<W: Write>(
 
 static SNAPPY: AtomicU8 = AtomicU8::new(2); // 2 = unset, read SHOP_SNAPPY once
 
-/// Snappy page compression (codec 1) unless SHOP_SNAPPY=0.
+/// Snappy page compression (codec 1) only when SHOP_SNAPPY=1.
 fn snappy_enabled() -> bool {
     let v = SNAPPY.load(Ordering::Relaxed);
     if v != 2 {
         return v == 1;
     }
-    let on = !matches!(std::env::var("SHOP_SNAPPY").as_deref(), Ok("0") | Ok("false"));
+    let on = matches!(std::env::var("SHOP_SNAPPY").as_deref(), Ok("1") | Ok("true"));
     SNAPPY.store(on as u8, Ordering::Relaxed);
     on
 }

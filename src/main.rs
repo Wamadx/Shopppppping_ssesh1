@@ -69,10 +69,10 @@ impl Config {
                 .filter(|&b| b > 0)
                 .unwrap_or(chunk_kb * 1024),
             use_bitfilter: env_bool("SHOP_BITFILTER", true),
-            use_sortless: env_bool("SHOP_SORTLESS", false),
+            use_sortless: env_bool("SHOP_SORTLESS", true),
             use_prefetch: env_bool("SHOP_PREFETCH", false),
             use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
-            use_wc: env_bool("SHOP_WC", true),
+            use_wc: env_bool("SHOP_WC", false),
             timing: env_bool("TIMING", false),
             links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
             overlap: env_bool("SHOP_OVERLAP", true),
