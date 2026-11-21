@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -43,6 +43,8 @@ struct Config {
     links_legacy: bool,
     overlap: bool,
     bitfilter_bits: u32,
+    use_tickets: bool,
+    ticket_loc_max: u32,
 }
 
 impl Config {
@@ -74,6 +76,13 @@ impl Config {
             timing: env_bool("TIMING", false),
             links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
             overlap: env_bool("SHOP_OVERLAP", true),
+            use_tickets: env_bool("SHOP_TICKETS", true),
+            // Test-only: SHOP_TICKET_LOC_MAX forces the per-worker payload index overflow fallback.
+            ticket_loc_max: env::var("SHOP_TICKET_LOC_MAX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(LOC_NONE - 1)
+                .min(LOC_NONE - 1),
             bitfilter_bits: env::var("SHOP_BITFILTER_BITS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1728,95 +1737,9 @@ fn finish_day(cat_rev: &mut [i64], dirty_cats: &mut Vec<u16>) -> u16 {
     best_cat
 }
 
-fn main() -> io::Result<()> {
-    let t_total = Instant::now();
-    let cfg = Config::from_env();
-
-    let mut args = env::args_os().skip(1);
-    let data_dir = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into())));
-    let out_dir = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()))
-        });
-    let ncpu = env::var("NCPU")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| thread::available_parallelism().map_or(4, usize::from));
-
-    let (window_start, window_end) = parse_manifest(&data_dir.join("manifest.json"))?;
-    let base_ts = window_start - SEVEN_DAYS_MS;
-    assert!((window_end - base_ts) < (u32::MAX as i64));
-
-    let min_day = window_start.div_euclid(DAY_MS) as i32;
-    let max_day = (window_end - 1).div_euclid(DAY_MS) as i32;
-    let num_days = (max_day - min_day + 1).max(1) as usize;
-    let num_bins = if window_end > window_start {
-        (((window_end - window_start) as u32 / SESSION_GAP_REL) as usize) + 2
-    } else {
-        2
-    };
-
-    let (products, categories, unknown_cat_id) = load_products(&data_dir.join("products.csv"))?;
-    let (campaigns, campaign_list) = load_campaigns(&data_dir.join("campaigns.csv"))?;
-    let organic_idx = campaign_list.len() - 1;
-
-    let t0 = Instant::now();
-    let (links, ms_links, event_shards, ms_events_io) = if cfg.overlap {
-        // Links construction runs beside event parsing; dedup (the first links
-        // consumer) only starts after both join. Output is schedule-independent.
-        let (lres, eres) = thread::scope(|s| {
-            let h = s.spawn(|| {
-                let t = Instant::now();
-                load_links_dispatch(&data_dir, ncpu, cfg)
-                    .map(|l| (l, t.elapsed().as_secs_f64() * 1000.0))
-            });
-            let t1 = Instant::now();
-            let r = (|| -> io::Result<WorkerMatrix<RawEvent>> {
-                let event_files = list_csvs(&data_dir.join("events"))?;
-                read_events_parallel(
-                    &event_files,
-                    ncpu,
-                    cfg,
-                    base_ts,
-                    window_start,
-                    window_end,
-                    &products,
-                    unknown_cat_id,
-                )
-            })();
-            let ms_ev = t1.elapsed().as_secs_f64() * 1000.0;
-            (h.join().unwrap(), r.map(|ev| (ev, ms_ev)))
-        });
-        let (l, ml) = lres?;
-        let (ev, me) = eres?;
-        (l, ml, ev, me)
-    } else {
-        let links = load_links_dispatch(&data_dir, ncpu, cfg)?;
-        let ms_links = t0.elapsed().as_secs_f64() * 1000.0;
-        let t1 = Instant::now();
-        let event_files = list_csvs(&data_dir.join("events"))?;
-        let event_shards = read_events_parallel(
-            &event_files,
-            ncpu,
-            cfg,
-            base_ts,
-            window_start,
-            window_end,
-            &products,
-            unknown_cat_id,
-        )?;
-        let ms_events_io = t1.elapsed().as_secs_f64() * 1000.0;
-        (links, ms_links, event_shards, ms_events_io)
-    };
-
-    // Phase 2: In-place dedup across [0..ew][sh] -> 16-ahead AoS link prefetch -> scatter to 256 person shards
-    let t2 = Instant::now();
+/// Legacy Phase 2: in-place dedup of 32 B RawEvents per dedup shard, then link resolve and
+/// scatter to person shards. Used when tickets are off (SHOP_TICKETS=0) or the ticket parse bailed.
+fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, ncpu: usize, cfg: Config) -> Vec<Vec<Vec<PersonEvent>>> {
     let ew = event_shards.num_workers();
     let total_raw_events: usize = if ew == 0 {
         0
@@ -1943,6 +1866,499 @@ fn main() -> io::Result<()> {
         })
     };
     drop(event_shards);
+    pe_workers
+}
+
+/// P3b dedup ticket: one per parsed event copy, scattered to its event_id dedup shard.
+/// `ingest_s` = ingest seconds relative to `ingest_base_s`; `loc` = index of the copy's payload in its
+/// parse worker's payload array, or `LOC_NONE` when the copy is invalid (it still takes part in
+/// dedup, so an invalid earliest copy kills later valid ones).
+#[derive(Clone, Copy, Default)]
+struct Ticket {
+    event_id: Key,
+    ingest_s: u32,
+    loc: u32,
+}
+
+/// P3b payload: written once, sequentially, per valid copy. Dedup losers are killed in place by
+/// setting `user_id = Key::EMPTY` (never produced by `Key::from_bytes`).
+#[derive(Clone, Copy, Default)]
+struct Payload {
+    user_id: Key,
+    packed_ev: u64, // ((ts_rel as u64) << 32) | (price_cat as u64)
+}
+
+const LOC_NONE: u32 = u32::MAX;
+const _: () = assert!(std::mem::size_of::<Ticket>() * 4 == 64);
+const _: () = assert!(std::mem::size_of::<Payload>() == 16);
+
+enum EventsOut {
+    Legacy(WorkerMatrix<RawEvent>),
+    Tickets(WorkerMatrix<Ticket>, Vec<Vec<Payload>>),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_events_dispatch(
+    paths: &[PathBuf],
+    ncpu: usize,
+    cfg: Config,
+    base_ts: i64,
+    window_start: i64,
+    window_end: i64,
+    products: &ProductCatalog,
+    unknown_cat_id: u16,
+) -> io::Result<EventsOut> {
+    if cfg.use_tickets {
+        if let Some((tk, pl)) =
+            read_events_tickets(paths, ncpu, cfg, base_ts, window_start, window_end, products, unknown_cat_id)?
+        {
+            return Ok(EventsOut::Tickets(tk, pl));
+        }
+        if cfg.timing {
+            eprintln!("TICKETS bail: falling back to the 32 B RawEvent path");
+        }
+    }
+    Ok(EventsOut::Legacy(read_events_parallel(
+        paths, ncpu, cfg, base_ts, window_start, window_end, products, unknown_cat_id,
+    )?))
+}
+
+/// Ticket parse. Returns `Ok(None)` (caller re-parses on the legacy path) if any `ingest_ts` is not a
+/// whole second, falls outside the u32 seconds range, or a worker's payload index would overflow.
+#[allow(clippy::too_many_arguments)]
+fn read_events_tickets(
+    paths: &[PathBuf],
+    ncpu: usize,
+    cfg: Config,
+    base_ts: i64,
+    window_start: i64,
+    window_end: i64,
+    products: &ProductCatalog,
+    unknown_cat_id: u16,
+) -> io::Result<Option<(WorkerMatrix<Ticket>, Vec<Vec<Payload>>)>> {
+    let (files, chunks) = plan_file_chunks(paths, cfg.chunk_bytes)?;
+    if chunks.is_empty() {
+        return Ok(Some((WorkerMatrix::new(Vec::new()), Vec::new())));
+    }
+    let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
+    // >= 2048 tickets (32 KiB) keeps every shard Vec on the huge-page slab allocator, not musl malloc.
+    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(2048);
+    let per_worker_payload_cap = ((total_bytes / 52) as usize / ncpu).max(1024);
+    let ingest_base_s = base_ts.div_euclid(1000) - (1i64 << 31);
+    let loc_max = cfg.ticket_loc_max as usize;
+    let bail = AtomicBool::new(false);
+    let next_chunk = AtomicUsize::new(0);
+    let workers: Vec<(Vec<Vec<Ticket>>, Vec<Payload>)> = thread::scope(|s| {
+        let mut handles = Vec::with_capacity(ncpu);
+        for _ in 0..ncpu {
+            handles.push(s.spawn(|| {
+                let mut out: Vec<Vec<Ticket>> = (0..NUM_DEDUP_SHARDS)
+                    .map(|_| Vec::with_capacity(per_shard_cap))
+                    .collect();
+                let mut payloads: Vec<Payload> = Vec::with_capacity(per_worker_payload_cap);
+                let mut wc: WcSink<Ticket, 4> = WcSink::new(NUM_DEDUP_SHARDS, cfg.use_wc);
+                let mut dc_ing = DateCache::new();
+                let mut dc_ts = DateCache::new();
+                let mut buf = Vec::new();
+                let mut bad = false;
+                loop {
+                    if bad || bail.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if cidx >= chunks.len() {
+                        break;
+                    }
+                    let ch = &chunks[cidx];
+                    let (start, own_end, scan_len) =
+                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                            .expect("failed to read event chunk");
+                    for_each_record_simd::<7>(
+                        &buf,
+                        start,
+                        own_end,
+                        scan_len,
+                        |[eid, uid, ts_b, ing_b, etype, pid, price_b]| {
+                            if bad || eid.is_empty() {
+                                return;
+                            }
+                            let Some(ingest_ts) = dc_ing.parse_ts(ing_b) else {
+                                return;
+                            };
+                            let ing_rel = ingest_ts.div_euclid(1000) - ingest_base_s;
+                            if ingest_ts.rem_euclid(1000) != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
+                                bad = true;
+                                return;
+                            }
+
+                            let mut ts_rel = u32::MAX;
+                            let mut price_cat = 0u32;
+
+                            if !uid.is_empty() && !pid.is_empty() {
+                                match etype {
+                                    b"view" | b"cart" => {
+                                        if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                            if ts >= window_start
+                                                && ts < window_end
+                                                && ingest_ts - ts <= DAY_MS
+                                            {
+                                                ts_rel = (ts - base_ts) as u32;
+                                            }
+                                        }
+                                    }
+                                    b"purchase" => {
+                                        if let Some(p) = parse_price_cents(price_b) {
+                                            if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                                if ts >= window_start
+                                                    && ts < window_end
+                                                    && ingest_ts - ts <= DAY_MS
+                                                {
+                                                    ts_rel = (ts - base_ts) as u32;
+                                                    let cid = products.get(pid, unknown_cat_id);
+                                                    price_cat = (((cid as u32) + 1) << 24)
+                                                        | (p as u32);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            let event_id = Key::from_bytes(eid);
+                            let loc = if ts_rel != u32::MAX {
+                                let l = payloads.len();
+                                if l >= loc_max {
+                                    bad = true;
+                                    return;
+                                }
+                                payloads.push(Payload {
+                                    user_id: Key::from_bytes(uid),
+                                    packed_ev: ((ts_rel as u64) << 32) | (price_cat as u64),
+                                });
+                                l as u32
+                            } else {
+                                LOC_NONE
+                            };
+                            let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
+                            wc.push(
+                                shard,
+                                Ticket {
+                                    event_id,
+                                    ingest_s: ing_rel as u32,
+                                    loc,
+                                },
+                                &mut out,
+                            );
+                        },
+                    );
+                }
+                if bad {
+                    bail.store(true, Ordering::Relaxed);
+                }
+                wc.finish(&mut out);
+                (out, payloads)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    if bail.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let (tickets, payloads): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
+    Ok(Some((WorkerMatrix::new(tickets), payloads)))
+}
+
+/// Exact dedup table over the (few) tickets that the seen/dup bitmap could not prove unique.
+struct TicketTable {
+    slots: Vec<u64>,
+    mask: usize,
+}
+
+impl TicketTable {
+    fn new() -> Self {
+        Self { slots: vec![0; 1024], mask: 1023 }
+    }
+
+    fn reset(&mut self, needed: usize) {
+        let cap = needed.saturating_mul(2).max(1024).next_power_of_two();
+        if cap > self.slots.len() {
+            self.slots.resize(cap, 0);
+        }
+        self.slots[..cap].fill(0);
+        self.mask = cap - 1;
+    }
+
+    #[inline(always)]
+    fn get_or_insert(&mut self, eid: Key, kept: &[(Ticket, u32)]) -> Option<usize> {
+        let h = eid.hash64();
+        let tag = (h >> 23) & 0xFFFF_FFFF;
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let slot_val = unsafe { *self.slots.get_unchecked(idx) };
+            if slot_val == 0 {
+                unsafe { *self.slots.get_unchecked_mut(idx) = (tag << 32) | ((kept.len() as u64) + 1) };
+                return None;
+            }
+            if (slot_val >> 32) == tag {
+                let pos = ((slot_val as u32) - 1) as usize;
+                if unsafe { kept.get_unchecked(pos) }.0.event_id == eid {
+                    return Some(pos);
+                }
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+/// P3b Phase 2. (a) Per dedup shard: tickets the bitmap proves unique need no work at all (their
+/// payload stays live); the rest go through an exact table keeping the smallest ingest, and every
+/// losing copy's payload is killed in place. (b) Each worker's payload array is scanned
+/// sequentially; live payloads are link-resolved and written once to their person shard.
+fn dedup_route_tickets(
+    tickets: WorkerMatrix<Ticket>,
+    mut payloads: Vec<Vec<Payload>>,
+    links: &LinkTable,
+    ncpu: usize,
+    cfg: Config,
+) -> Vec<Vec<Vec<PersonEvent>>> {
+    let ew = tickets.num_workers();
+    if ew == 0 {
+        return Vec::new();
+    }
+    let pay_ptrs: Vec<usize> = payloads.iter_mut().map(|v| v.as_mut_ptr() as usize).collect();
+    let next_shard = AtomicUsize::new(0);
+    thread::scope(|s| {
+        for _ in 0..ncpu {
+            s.spawn(|| {
+                let mut table = TicketTable::new();
+                let mut cand: Vec<(Ticket, u32)> = Vec::new();
+                let mut kept: Vec<(Ticket, u32)> = Vec::new();
+                let mut seen_bm: Vec<u64> = Vec::new();
+                let mut dup_bm: Vec<u64> = Vec::new();
+                // Each payload has exactly one ticket, so no element is ever written by two threads.
+                let kill = |t: u32, loc: u32| {
+                    if loc != LOC_NONE {
+                        unsafe { (*(pay_ptrs[t as usize] as *mut Payload).add(loc as usize)).user_id = Key::EMPTY };
+                    }
+                };
+                loop {
+                    let sh = next_shard.fetch_add(1, Ordering::Relaxed);
+                    if sh >= NUM_DEDUP_SHARDS {
+                        break;
+                    }
+                    let total_len = tickets.shard_len(sh);
+                    if total_len == 0 {
+                        continue;
+                    }
+                    let bm_on = cfg.use_dedup_bitmap;
+                    let bm_bits = if bm_on { (total_len * 16).next_power_of_two().max(1 << 12) } else { 0 };
+                    let bm_mask = bm_bits.wrapping_sub(1);
+                    if bm_on {
+                        let words = bm_bits / 64;
+                        seen_bm.clear();
+                        seen_bm.resize(words, 0);
+                        dup_bm.clear();
+                        dup_bm.resize(words, 0);
+                        for t in 0..ew {
+                            for tk in unsafe { tickets.get_mut(t, sh) }.iter() {
+                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
+                                let (w, m) = (b >> 6, 1u64 << (b & 63));
+                                let sw = unsafe { seen_bm.get_unchecked_mut(w) };
+                                let hit = *sw & m;
+                                *sw |= m;
+                                unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                            }
+                        }
+                    }
+                    cand.clear();
+                    for t in 0..ew {
+                        let raw = unsafe { tickets.get_mut(t, sh) };
+                        for tk in raw.iter() {
+                            if bm_on {
+                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
+                                if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
+                                    continue;
+                                }
+                            }
+                            cand.push((*tk, t as u32));
+                        }
+                        *raw = Vec::new();
+                    }
+                    if cand.is_empty() {
+                        continue;
+                    }
+                    table.reset(cand.len());
+                    kept.clear();
+                    for &(tk, t) in cand.iter() {
+                        if let Some(pos) = table.get_or_insert(tk.event_id, &kept) {
+                            let cur = unsafe { kept.get_unchecked_mut(pos) };
+                            if tk.ingest_s < cur.0.ingest_s {
+                                kill(cur.1, cur.0.loc);
+                                *cur = (tk, t);
+                            } else {
+                                // Copies with equal ingest_ts are identical, so dropping either is exact.
+                                kill(t, tk.loc);
+                            }
+                        } else {
+                            kept.push((tk, t));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    drop(tickets);
+
+    const UNIT: usize = 1 << 16;
+    let mut units: Vec<(usize, usize, usize)> = Vec::new();
+    let mut total_payloads = 0usize;
+    for (t, p) in payloads.iter().enumerate() {
+        total_payloads += p.len();
+        let mut st = 0;
+        while st < p.len() {
+            let en = (st + UNIT).min(p.len());
+            units.push((t, st, en));
+            st = en;
+        }
+    }
+    let per_person_shard_cap = (total_payloads / (ncpu * NUM_PERSON_SHARDS)).max(64);
+    let next_unit = AtomicUsize::new(0);
+    let payloads_ref = &payloads;
+    let units_ref = &units;
+    let pe_workers: Vec<Vec<Vec<PersonEvent>>> = thread::scope(|s| {
+        let mut handles = Vec::with_capacity(ncpu);
+        for _ in 0..ncpu {
+            handles.push(s.spawn(|| {
+                let mut out: Vec<Vec<PersonEvent>> = (0..NUM_PERSON_SHARDS)
+                    .map(|_| Vec::with_capacity(per_person_shard_cap))
+                    .collect();
+                let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
+                let mut pwc: WcSink<PersonEvent, 4> = WcSink::new(NUM_PERSON_SHARDS, cfg.use_wc);
+                loop {
+                    let u = next_unit.fetch_add(1, Ordering::Relaxed);
+                    if u >= units_ref.len() {
+                        break;
+                    }
+                    let (t, st, en) = units_ref[u];
+                    let sl = &payloads_ref[t][st..en];
+                    let n = sl.len();
+                    for i in 0..n {
+                        if i + 16 < n {
+                            links.prefetch(unsafe { sl.get_unchecked(i + 16) }.user_id);
+                        }
+                        let p = unsafe { *sl.get_unchecked(i) };
+                        if p.user_id == Key::EMPTY {
+                            continue;
+                        }
+                        let person_id = links.resolve(p.user_id, &mut link_cache);
+                        let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                        pwc.push(psh, PersonEvent { person_id, packed_ev: p.packed_ev }, &mut out);
+                    }
+                }
+                pwc.finish(&mut out);
+                out
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    drop(payloads);
+    pe_workers
+}
+
+fn main() -> io::Result<()> {
+    let t_total = Instant::now();
+    let cfg = Config::from_env();
+
+    let mut args = env::args_os().skip(1);
+    let data_dir = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into())));
+    let out_dir = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()))
+        });
+    let ncpu = env::var("NCPU")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| thread::available_parallelism().map_or(4, usize::from));
+
+    let (window_start, window_end) = parse_manifest(&data_dir.join("manifest.json"))?;
+    let base_ts = window_start - SEVEN_DAYS_MS;
+    assert!((window_end - base_ts) < (u32::MAX as i64));
+
+    let min_day = window_start.div_euclid(DAY_MS) as i32;
+    let max_day = (window_end - 1).div_euclid(DAY_MS) as i32;
+    let num_days = (max_day - min_day + 1).max(1) as usize;
+    let num_bins = if window_end > window_start {
+        (((window_end - window_start) as u32 / SESSION_GAP_REL) as usize) + 2
+    } else {
+        2
+    };
+
+    let (products, categories, unknown_cat_id) = load_products(&data_dir.join("products.csv"))?;
+    let (campaigns, campaign_list) = load_campaigns(&data_dir.join("campaigns.csv"))?;
+    let organic_idx = campaign_list.len() - 1;
+
+    let t0 = Instant::now();
+    let (links, ms_links, events_out, ms_events_io) = if cfg.overlap {
+        // Links construction runs beside event parsing; dedup (the first links
+        // consumer) only starts after both join. Output is schedule-independent.
+        let (lres, eres) = thread::scope(|s| {
+            let h = s.spawn(|| {
+                let t = Instant::now();
+                load_links_dispatch(&data_dir, ncpu, cfg)
+                    .map(|l| (l, t.elapsed().as_secs_f64() * 1000.0))
+            });
+            let t1 = Instant::now();
+            let r = (|| -> io::Result<EventsOut> {
+                let event_files = list_csvs(&data_dir.join("events"))?;
+                read_events_dispatch(
+                    &event_files,
+                    ncpu,
+                    cfg,
+                    base_ts,
+                    window_start,
+                    window_end,
+                    &products,
+                    unknown_cat_id,
+                )
+            })();
+            let ms_ev = t1.elapsed().as_secs_f64() * 1000.0;
+            (h.join().unwrap(), r.map(|ev| (ev, ms_ev)))
+        });
+        let (l, ml) = lres?;
+        let (ev, me) = eres?;
+        (l, ml, ev, me)
+    } else {
+        let links = load_links_dispatch(&data_dir, ncpu, cfg)?;
+        let ms_links = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = Instant::now();
+        let event_files = list_csvs(&data_dir.join("events"))?;
+        let events_out = read_events_dispatch(
+            &event_files,
+            ncpu,
+            cfg,
+            base_ts,
+            window_start,
+            window_end,
+            &products,
+            unknown_cat_id,
+        )?;
+        let ms_events_io = t1.elapsed().as_secs_f64() * 1000.0;
+        (links, ms_links, events_out, ms_events_io)
+    };
+
+    // Phase 2: dedup -> link resolve -> scatter to 256 person shards (ticket path or legacy).
+    let t2 = Instant::now();
+    let pe_workers = match events_out {
+        EventsOut::Legacy(ev) => dedup_route_legacy(ev, &links, ncpu, cfg),
+        EventsOut::Tickets(tk, pl) => dedup_route_tickets(tk, pl, &links, ncpu, cfg),
+    };
     let person_event_shards = WorkerMatrix::new(pe_workers);
     let ms_dedup = t2.elapsed().as_secs_f64() * 1000.0;
 
