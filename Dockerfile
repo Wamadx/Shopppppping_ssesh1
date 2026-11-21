@@ -6,7 +6,7 @@ COPY src ./src
 
 # PGO is mandatory: any failure aborts the build instead of silently shipping a non-PGO binary.
 # Profile generation and use share the same target flags so the profile matches the final code.
-ENV CPU_FLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f,+crt-static"
+ENV CPU_FLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f,+crt-static -C llvm-args=-x86-branches-within-32B-boundaries"
 RUN set -eux; \
     PROFDATA="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"; \
     RUSTFLAGS="" CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8 \
