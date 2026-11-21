@@ -58,7 +58,7 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&k| k >= 64)
-            .unwrap_or(1024);
+            .unwrap_or(256);
         Self {
             // SHOP_CHUNK_B (bytes, test-only) overrides the 64 KiB floor so tests can force many chunk boundaries.
             chunk_bytes: env::var("SHOP_CHUNK_B")
@@ -1329,10 +1329,19 @@ struct CampaignAgg {
     assisted_sessions: i32,
 }
 
-/// Software write-combining scatter: stages `N` records per shard and appends each full
-/// 64-byte group to the shard Vec with non-temporal stores (no read-for-ownership of the
-/// destination line). `finish` appends partial groups and issues `sfence` so the streamed
-/// data is globally visible before the worker returns to its join.
+/// Software write-combining scatter, reusable for any record stream (P3b tickets/payloads).
+///
+/// API: `WcSink::<T, N>::new(num_shards, enabled)`, then per record
+/// `sink.push(shard, record, &mut out)` where `out: &mut [Vec<T>]` holds one Vec per shard, and
+/// exactly once per worker, before it returns, `sink.finish(&mut out)`.
+/// Requirements: `N * size_of::<T>() == 64` for the streaming path (e.g. 16 B records -> N = 4,
+/// 32 B -> N = 2; other sizes still work through plain copies).
+///
+/// Each full 64 B group is appended with two `_mm256_stream_si256` stores (no read-for-ownership)
+/// when the destination is 64 B aligned (Vec storage from the allocator's slabs is), otherwise
+/// with a plain copy. `finish` appends partial tails with plain stores and issues `_mm_sfence`,
+/// so streamed data is globally visible before the worker's join. `enabled = false` (SHOP_WC=0)
+/// pushes directly.
 struct WcSink<T: Copy + Default, const N: usize> {
     stage: Vec<[T; N]>,
     cnt: Vec<u8>,

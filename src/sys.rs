@@ -66,6 +66,22 @@ mod linux_sys {
         (aligned_addr as *mut u8, len)
     }
 
+    /// See [`crate::sys::alloc_slab`].
+    #[allow(dead_code)]
+    pub fn alloc_slab(bytes: usize) -> (*mut u8, usize) {
+        let (p, len) = unsafe { map_huge_aligned(bytes) };
+        if !p.is_null() {
+            // Pre-write one byte per 4 KiB so later read-before-write access never maps the
+            // huge zero page and then takes a second (COW) fault on the first store.
+            let mut off = 0;
+            while off < len {
+                unsafe { ptr::write_volatile(p.add(off), 0) };
+                off += 4096;
+            }
+        }
+        (p, len)
+    }
+
     static SLAB_LOCK: AtomicUsize = AtomicUsize::new(0);
     static SLAB_CUR: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
     static SLAB_END: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
@@ -182,6 +198,24 @@ mod linux_sys {
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOCATOR: linux_sys::HugeBlocks = linux_sys::HugeBlocks;
+
+/// Slab API for scatter sinks and large tables (owned by the allocator; callers must not edit
+/// sys.rs). Returns `(ptr, len)`: `len >= bytes`, rounded up to 2 MiB; `ptr` is 2 MiB aligned,
+/// `MADV_HUGEPAGE`, zero-filled and pre-written (no first-touch zero-page faults later), and it
+/// is never unmapped during the run (`_exit` reclaims it). Null on mmap failure.
+#[allow(dead_code)] // consumed by P3b/P3c sinks
+pub fn alloc_slab(bytes: usize) -> (*mut u8, usize) {
+    #[cfg(target_os = "linux")]
+    {
+        linux_sys::alloc_slab(bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let len = (bytes.max(1) + (2 << 20) - 1) & !((2 << 20) - 1);
+        let layout = std::alloc::Layout::from_size_align(len, 2 << 20).unwrap();
+        (unsafe { std::alloc::alloc_zeroed(layout) }, len)
+    }
+}
 
 /// Early writeback of Parquet pages after each row group, unless SHOP_WRITEBACK=0.
 pub fn writeback_enabled() -> bool {
@@ -339,7 +373,9 @@ pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -
     // TEST_SLOP (compile-time, tests only) shrinks the tail read so lines straddling the slop are exercised.
     const SLOP: usize = match option_env!("TEST_SLOP") {
         Some(_) => 16,
-        None => 65536,
+        // Lines are ~100 B; a line that outruns the slop is handled by the tail-extension path.
+        // 4 KiB keeps a 256 KiB chunk's re-read at ~1.6% and the buffer L2-resident.
+        None => 4096,
     };
     const SIMD_PAD: usize = 64;
 
