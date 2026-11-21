@@ -595,8 +595,11 @@ pub struct DateCache {
     last_k0: u64,
     last_k1: u16,
     last_day_ms: i64,
-    entries: [DateEntry; 64],
+    entries: [DateEntry; DATE_CACHE_SLOTS],
 }
+
+const DATE_CACHE_SLOTS: usize = 256;
+const DATE_CACHE_SHIFT: u32 = 56; // 64 - log2(DATE_CACHE_SLOTS)
 
 impl DateCache {
     pub fn new() -> Self {
@@ -608,49 +611,62 @@ impl DateCache {
                 k0: u64::MAX,
                 k1: u16::MAX,
                 day_ms: i64::MIN,
-            }; 64],
+            }; DATE_CACHE_SLOTS],
         }
+    }
+
+    /// Epoch ms of the `YYYY-MM-DD` date in `s[0..10]`, memoised by its exact
+    /// 10 bytes. Returns None for an invalid date (also memoised).
+    #[inline(always)]
+    fn cached_day_ms(&mut self, s: &[u8]) -> Option<i64> {
+        let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
+        let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
+        let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
+            self.last_day_ms
+        } else {
+            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> DATE_CACHE_SHIFT) as usize;
+            let ent = &self.entries[slot];
+            let val = if ent.k0 == k0 && ent.k1 == k1 {
+                ent.day_ms
+            } else {
+                let val = parse_date_10(&s[0..10]).unwrap_or(i64::MIN);
+                self.entries[slot] = DateEntry { k0, k1, day_ms: val };
+                val
+            };
+            self.last_k0 = k0;
+            self.last_k1 = k1;
+            self.last_day_ms = val;
+            val
+        };
+        if d_ms == i64::MIN { None } else { Some(d_ms) }
     }
 
     #[inline(always)]
     pub fn parse_ts(&mut self, s: &[u8]) -> Option<i64> {
         let len = s.len();
         if len == 20 && s[19] == b'Z' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
-            let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
-            let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
-            let day_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
-                if self.last_day_ms == i64::MIN {
-                    return None;
-                }
-                self.last_day_ms
-            } else {
-                let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> 58) as usize;
-                let ent = &self.entries[slot];
-                let d_ms = if ent.k0 == k0 && ent.k1 == k1 {
-                    if ent.day_ms == i64::MIN {
-                        return None;
-                    }
-                    ent.day_ms
-                } else {
-                    let d = parse_date_10(&s[0..10]);
-                    let val = d.unwrap_or(i64::MIN);
-                    self.entries[slot] = DateEntry {
-                        k0,
-                        k1,
-                        day_ms: val,
-                    };
-                    val
-                };
-                self.last_k0 = k0;
-                self.last_k1 = k1;
-                self.last_day_ms = d_ms;
-                if d_ms == i64::MIN {
-                    return None;
-                }
-                d_ms
-            };
+            let day_ms = self.cached_day_ms(s)?;
             let hms_ms = parse_hms_swar(&s[11..19])?;
             return Some(day_ms + hms_ms);
+        }
+        // F2: same date/time layout plus a +HH:MM / -HH:MM offset (same checks as parse_ts).
+        if len == 25
+            && (s[19] == b'+' || s[19] == b'-')
+            && s[22] == b':'
+            && s[10] == b'T'
+            && s[13] == b':'
+            && s[16] == b':'
+        {
+            let day_ms = self.cached_day_ms(s)?;
+            let hms_ms = parse_hms_swar(&s[11..19])?;
+            let off_h = parse_2(s[20], s[21])?;
+            let off_m = parse_2(s[23], s[24])?;
+            if off_h > 23 || off_m > 59 {
+                return None;
+            }
+            let off_ms = (off_h * 60 + off_m) * 60_000;
+            let ms = day_ms + hms_ms;
+            return Some(if s[19] == b'+' { ms - off_ms } else { ms + off_ms });
         }
         if len == 13 {
             if let (Some(hi8), Some(lo8)) = (parse_8_digits_swar(&s[0..8]), parse_8_digits_swar(&s[5..13])) {
