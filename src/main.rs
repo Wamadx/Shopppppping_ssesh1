@@ -37,6 +37,7 @@ struct Config {
     use_bitfilter: bool,
     use_sortless: bool,
     use_prefetch: bool,
+    use_dedup_bitmap: bool,
     timing: bool,
 }
 
@@ -64,6 +65,7 @@ impl Config {
             use_bitfilter: env_bool("SHOP_BITFILTER", true),
             use_sortless: env_bool("SHOP_SORTLESS", false),
             use_prefetch: env_bool("SHOP_PREFETCH", false),
+            use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
             timing: env_bool("TIMING", false),
         }
     }
@@ -1177,6 +1179,8 @@ fn main() -> io::Result<()> {
                         .map(|_| Vec::with_capacity(per_person_shard_cap))
                         .collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
+                    let mut seen_bm: Vec<u64> = Vec::new();
+                    let mut dup_bm: Vec<u64> = Vec::new();
 
                     loop {
                         let sh = next_shard.fetch_add(1, Ordering::Relaxed);
@@ -1192,6 +1196,32 @@ fn main() -> io::Result<()> {
                         if kept.capacity() < total_len {
                             kept.reserve(total_len - kept.capacity());
                         }
+
+                        // Seen/dup bitmap prefilter: every copy of a repeated event_id sets the same
+                        // bit, so an event whose bit was hit only once is unique and skips the exact
+                        // table. Only the ~2-4% duplicated ids (plus bitmap collisions) are probed.
+                        let bm_on = cfg.use_dedup_bitmap;
+                        let bm_bits = if bm_on { (total_len * 16).next_power_of_two().max(1 << 12) } else { 0 };
+                        let bm_mask = bm_bits.wrapping_sub(1);
+                        if bm_on {
+                            let words = bm_bits / 64;
+                            seen_bm.clear();
+                            seen_bm.resize(words, 0);
+                            dup_bm.clear();
+                            dup_bm.resize(words, 0);
+                            for t in 0..ew {
+                                let raw = unsafe { event_shards.get_mut(t, sh) };
+                                for ev in raw.iter() {
+                                    let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
+                                    let (w, m) = (b >> 6, 1u64 << (b & 63));
+                                    let sw = unsafe { seen_bm.get_unchecked_mut(w) };
+                                    let hit = *sw & m;
+                                    *sw |= m;
+                                    unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                                }
+                            }
+                        }
+
                         for t in 0..ew {
                             let raw = unsafe { event_shards.get_mut(t, sh) };
                             let rlen = raw.len();
@@ -1200,6 +1230,22 @@ fn main() -> io::Result<()> {
                                     table.prefetch(raw[i + 16].event_id);
                                 }
                                 let ev = raw[i];
+                                if bm_on {
+                                    let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
+                                    if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
+                                        if ev.ts_rel != u32::MAX {
+                                            if i + 16 < rlen && raw[i + 16].ts_rel != u32::MAX {
+                                                links.prefetch(raw[i + 16].user_id);
+                                            }
+                                            let person_id = links.resolve(ev.user_id, &mut link_cache);
+                                            let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                                            let packed_ev =
+                                                ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
+                                            out[psh].push(PersonEvent { person_id, packed_ev });
+                                        }
+                                        continue;
+                                    }
+                                }
                                 if let Some(pos) = table.get_or_insert(ev, &kept) {
                                     let cur = &mut kept[pos as usize];
                                     if ev.ingest_ts < cur.ingest_ts {
