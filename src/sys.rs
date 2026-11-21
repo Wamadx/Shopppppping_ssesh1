@@ -267,7 +267,7 @@ pub fn plan_file_chunks(paths: &[PathBuf], target_chunk_bytes: usize) -> io::Res
     // Schedule largest files first to minimize tail stragglers across worker threads.
     meta.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-    let chunk_sz = (target_chunk_bytes.max(64 * 1024)) as u64;
+    let chunk_sz = (target_chunk_bytes.max(1)) as u64;
     let mut files = Vec::with_capacity(meta.len());
     let mut chunks = Vec::new();
     for (fidx, (len, file, data_start)) in meta.into_iter().enumerate() {
@@ -295,7 +295,11 @@ pub fn plan_file_chunks(paths: &[PathBuf], target_chunk_bytes: usize) -> io::Res
 /// Returns `(first_line_off_in_buf, own_end_in_buf, scan_len)` so every line with `line_start in [c_start, c_end)`
 /// is terminated by `\n` inside `buf[first_line_off..scan_len]`.
 pub fn load_chunk_lines(f: &OpenCsvFile, chunk: &FileChunk, buf: &mut Vec<u8>) -> io::Result<(usize, usize, usize)> {
-    const SLOP: usize = 65536;
+    // TEST_SLOP (compile-time, tests only) shrinks the tail read so lines straddling the slop are exercised.
+    const SLOP: usize = match option_env!("TEST_SLOP") {
+        Some(_) => 16,
+        None => 65536,
+    };
     const SIMD_PAD: usize = 64;
 
     let read_start = if chunk.c_start > f.data_start {

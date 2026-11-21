@@ -55,7 +55,12 @@ impl Config {
             .filter(|&k| k >= 64)
             .unwrap_or(1024);
         Self {
-            chunk_bytes: chunk_kb * 1024,
+            // SHOP_CHUNK_B (bytes, test-only) overrides the 64 KiB floor so tests can force many chunk boundaries.
+            chunk_bytes: env::var("SHOP_CHUNK_B")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&b| b > 0)
+                .unwrap_or(chunk_kb * 1024),
             use_bitfilter: env_bool("SHOP_BITFILTER", true),
             use_sortless: env_bool("SHOP_SORTLESS", false),
             use_prefetch: env_bool("SHOP_PREFETCH", false),
@@ -978,6 +983,53 @@ fn insertion_sort_u64(arr: &mut [u64]) {
     }
 }
 
+/// Sliding multiset of campaigns over a person's click window `[c_lo, c_hi)`.
+/// `active` lists exactly the campaigns with a non-zero count, so an assisted session
+/// costs O(distinct campaigns in window) instead of O(clicks in window).
+struct AssistWindow {
+    cnt: Vec<u32>,
+    pos: Vec<u32>,
+    active: Vec<u32>,
+}
+
+impl AssistWindow {
+    fn new(num_campaigns: usize) -> Self {
+        Self { cnt: vec![0; num_campaigns], pos: vec![0; num_campaigns], active: Vec::with_capacity(64) }
+    }
+
+    #[inline(always)]
+    fn enter(&mut self, ci: u32) {
+        let c = &mut self.cnt[ci as usize];
+        *c += 1;
+        if *c == 1 {
+            self.pos[ci as usize] = self.active.len() as u32;
+            self.active.push(ci);
+        }
+    }
+
+    #[inline(always)]
+    fn leave(&mut self, ci: u32) {
+        let c = &mut self.cnt[ci as usize];
+        *c -= 1;
+        if *c == 0 {
+            let p = self.pos[ci as usize] as usize;
+            let last = self.active.pop().unwrap_or(ci);
+            if last != ci {
+                self.active[p] = last;
+                self.pos[last as usize] = p as u32;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn reset(&mut self) {
+        for &ci in &self.active {
+            self.cnt[ci as usize] = 0;
+        }
+        self.active.clear();
+    }
+}
+
 #[inline(always)]
 fn credit_session(
     pclks: &[CompactClick],
@@ -990,14 +1042,15 @@ fn credit_session(
     num_days: usize,
     organic_idx: usize,
     camp_agg: &mut [CampaignAgg],
-    seen_assist: &mut [u32],
-    assist_gen: &mut u32,
+    aw: &mut AssistWindow,
 ) {
     let min_click_rel = session_start_rel - SEVEN_DAYS_REL;
     while *c_hi < pclks.len() && pclks[*c_hi].ts_rel <= session_start_rel {
+        aw.enter(pclks[*c_hi].campaign_idx);
         *c_hi += 1;
     }
     while *c_lo < *c_hi && pclks[*c_lo].ts_rel < min_click_rel {
+        aw.leave(pclks[*c_lo].campaign_idx);
         *c_lo += 1;
     }
 
@@ -1017,17 +1070,9 @@ fn credit_session(
             cell.revenue_cents += sess_rev;
         }
 
-        *assist_gen = assist_gen.wrapping_add(1);
-        if *assist_gen == 0 {
-            seen_assist.fill(0);
-            *assist_gen = 1;
-        }
-        for clk in &pclks[*c_lo..*c_hi] {
-            let ci_idx = clk.campaign_idx as usize;
-            if seen_assist[ci_idx] != *assist_gen {
-                seen_assist[ci_idx] = *assist_gen;
-                camp_agg[ci_idx * num_days + day_off].assisted_sessions += 1;
-            }
+        // Every campaign with at least one click in [start - 7d, start] assists once.
+        for &ci in &aw.active {
+            camp_agg[ci as usize * num_days + day_off].assisted_sessions += 1;
         }
     }
 }
@@ -1244,8 +1289,7 @@ fn main() -> io::Result<()> {
                 let mut camp_agg = vec![CampaignAgg::default(); num_campaigns * num_days];
                 let mut cat_rev = vec![0i64; num_cats];
                 let mut dirty_cats: Vec<u16> = Vec::with_capacity(16);
-                let mut seen_assist = vec![0u32; num_campaigns];
-                let mut assist_gen = 1u32;
+                let mut assist_win = AssistWindow::new(num_campaigns);
 
                 let mut pmap = LocalPersonMap::new(1 << 14);
                 let mut p_ids: Vec<Key> = Vec::new();
@@ -1464,6 +1508,7 @@ fn main() -> io::Result<()> {
 
                         let mut c_lo = 0usize;
                         let mut c_hi = 0usize;
+                        assist_win.reset();
                         let mut cur_day = i32::MIN;
                         let mut day_sessions = 0i32;
                         let mut day_events = 0i32;
@@ -1527,8 +1572,7 @@ fn main() -> io::Result<()> {
                                             num_days,
                                             organic_idx,
                                             &mut camp_agg,
-                                            &mut seen_assist,
-                                            &mut assist_gen,
+                                            &mut assist_win,
                                         );
                                     }
                                     let sday =
@@ -1597,8 +1641,7 @@ fn main() -> io::Result<()> {
                                     num_days,
                                     organic_idx,
                                     &mut camp_agg,
-                                    &mut seen_assist,
-                                    &mut assist_gen,
+                                    &mut assist_win,
                                 );
                             }
                         } else {
@@ -1690,8 +1733,7 @@ fn main() -> io::Result<()> {
                                     num_days,
                                     organic_idx,
                                     &mut camp_agg,
-                                    &mut seen_assist,
-                                    &mut assist_gen,
+                                    &mut assist_win,
                                 );
                             }
                         }
