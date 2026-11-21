@@ -1,0 +1,12 @@
+FROM rust:1.93-slim-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml ./
+COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+COPY --from=builder /build/target/release/shopping-sessions /app/shopping-sessions
+WORKDIR /app
+CMD ["/app/shopping-sessions"]

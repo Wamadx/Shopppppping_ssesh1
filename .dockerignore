@@ -1,0 +1,6 @@
+target/
+dev/
+out/
+fixtures/
+*.zip
+.git
