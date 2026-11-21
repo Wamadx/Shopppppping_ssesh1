@@ -182,6 +182,7 @@ fn encode_def_levels_from_bitmap(bitmap: &[u8], num_rows: usize, out: &mut Vec<u
 
 struct ChunkMeta<'a> {
     spec: &'a ColSpec<'a>,
+    dict_page_offset: Option<i64>,
     data_page_offset: i64,
     total_size: i64,
     num_values: i64,
@@ -223,13 +224,15 @@ fn write_file_metadata<W: Write>(
         t.list_hdr(&mut rlast, 1, 12, rg.chunks.len());
         for ch in &rg.chunks {
             let mut clast = 0i16;
-            t.i64_field(&mut clast, 2, ch.data_page_offset);
+            let first_page = ch.dict_page_offset.unwrap_or(ch.data_page_offset);
+            t.i64_field(&mut clast, 2, first_page);
             t.field_hdr(&mut clast, 3, 12);
             {
                 let mut mlast = 0i16;
                 t.i32_field(&mut mlast, 1, ch.spec.ty as i32);
                 t.list_hdr(&mut mlast, 2, 5, 2);
-                t.zz32(0);
+                // PLAIN_DICTIONARY (2) for dictionary-encoded chunks, else PLAIN (0); RLE (3) for levels.
+                t.zz32(if ch.dict_page_offset.is_some() { 2 } else { 0 });
                 t.zz32(3);
                 t.list_hdr(&mut mlast, 3, 8, 1);
                 let name = ch.spec.name.as_bytes();
@@ -240,6 +243,9 @@ fn write_file_metadata<W: Write>(
                 t.i64_field(&mut mlast, 6, ch.total_size);
                 t.i64_field(&mut mlast, 7, ch.total_size);
                 t.i64_field(&mut mlast, 9, ch.data_page_offset);
+                if let Some(d) = ch.dict_page_offset {
+                    t.i64_field(&mut mlast, 11, d);
+                }
                 t.stop();
             }
             t.stop();
@@ -276,6 +282,7 @@ fn write_col_page<W: Write>(
     *offset += total_size;
     Ok(ChunkMeta {
         spec,
+        dict_page_offset: None,
         data_page_offset: page_offset,
         total_size,
         num_values: num_rows as i64,
@@ -300,7 +307,169 @@ fn write_opt_col_page<W: Write>(
     *offset += total_size;
     Ok(ChunkMeta {
         spec,
+        dict_page_offset: None,
         data_page_offset: page_offset,
+        total_size,
+        num_values: num_rows as i64,
+    })
+}
+
+/// PageHeader for a V1 data page with an explicit value encoding.
+fn encode_data_page_header_enc(num_values: i32, payload_len: i32, encoding: i32) -> Vec<u8> {
+    let mut t = ThriftBuf::new();
+    let mut last = 0i16;
+    t.i32_field(&mut last, 1, 0);
+    t.i32_field(&mut last, 2, payload_len);
+    t.i32_field(&mut last, 3, payload_len);
+    t.field_hdr(&mut last, 5, 12);
+    let mut dlast = 0i16;
+    t.i32_field(&mut dlast, 1, num_values);
+    t.i32_field(&mut dlast, 2, encoding);
+    t.i32_field(&mut dlast, 3, 3);
+    t.i32_field(&mut dlast, 4, 3);
+    t.stop();
+    t.stop();
+    t.0
+}
+
+/// PageHeader for a dictionary page holding `num_values` PLAIN entries (PLAIN_DICTIONARY).
+fn encode_dict_page_header(num_values: i32, payload_len: i32) -> Vec<u8> {
+    let mut t = ThriftBuf::new();
+    let mut last = 0i16;
+    t.i32_field(&mut last, 1, 2);
+    t.i32_field(&mut last, 2, payload_len);
+    t.i32_field(&mut last, 3, payload_len);
+    t.field_hdr(&mut last, 7, 12);
+    let mut dlast = 0i16;
+    t.i32_field(&mut dlast, 1, num_values);
+    t.i32_field(&mut dlast, 2, 2);
+    t.stop();
+    t.stop();
+    t.0
+}
+
+const DICT_MAX_VALUE: u32 = 1 << 16;
+const DICT_MAX_ENTRIES: usize = 4096;
+
+/// Scratch for dictionary-encoding small non-negative INT32 columns.
+pub struct DictScratch {
+    slot: Vec<u32>, // value -> index + 1 (0 = absent); reset through `dict` after each use
+    dict: Vec<i32>,
+    dict_bytes: Vec<u8>,
+    idx: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl DictScratch {
+    pub fn new() -> Self {
+        Self {
+            slot: vec![0; DICT_MAX_VALUE as usize],
+            dict: Vec::with_capacity(DICT_MAX_ENTRIES),
+            dict_bytes: Vec::with_capacity(DICT_MAX_ENTRIES * 4),
+            idx: Vec::with_capacity(ROW_GROUP_ROWS),
+            data: Vec::with_capacity(ROW_GROUP_ROWS * 2),
+        }
+    }
+
+    fn clear_slots(&mut self) {
+        for &v in &self.dict {
+            self.slot[v as usize] = 0;
+        }
+        self.dict.clear();
+        self.idx.clear();
+    }
+
+    /// Builds dictionary + indices for `vals` (little-endian i32). Returns false when the column is
+    /// unsuitable (negative or large values, too many distinct values); the caller then writes PLAIN.
+    fn build(&mut self, vals: &[u8]) -> bool {
+        self.clear_slots();
+        for c in vals.chunks_exact(4) {
+            let v = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if (v as u32) >= DICT_MAX_VALUE {
+                self.clear_slots();
+                return false;
+            }
+            let sl = &mut self.slot[v as usize];
+            if *sl == 0 {
+                if self.dict.len() == DICT_MAX_ENTRIES {
+                    self.clear_slots();
+                    return false;
+                }
+                self.dict.push(v);
+                *sl = self.dict.len() as u32;
+            }
+            self.idx.push(*sl - 1);
+        }
+        true
+    }
+
+    /// Encodes indices as a 1-byte bit width followed by one bit-packed RLE-hybrid run.
+    fn encode_indices(&mut self) {
+        let n_dict = self.dict.len().max(2);
+        let bw = (usize::BITS - (n_dict - 1).leading_zeros()) as usize;
+        self.data.clear();
+        self.data.push(bw as u8);
+        let groups = self.idx.len().div_ceil(8);
+        let mut hdr = ((groups as u64) << 1) | 1;
+        loop {
+            let b = (hdr & 0x7f) as u8;
+            hdr >>= 7;
+            if hdr == 0 {
+                self.data.push(b);
+                break;
+            }
+            self.data.push(b | 0x80);
+        }
+        let mut acc: u64 = 0;
+        let mut nbits = 0usize;
+        for g in 0..groups {
+            for k in 0..8 {
+                let v = self.idx.get(g * 8 + k).copied().unwrap_or(0) as u64;
+                acc |= v << nbits;
+                nbits += bw;
+                while nbits >= 8 {
+                    self.data.push(acc as u8);
+                    acc >>= 8;
+                    nbits -= 8;
+                }
+            }
+        }
+    }
+}
+
+/// Writes a required INT32 column chunk, dictionary-encoded when the values allow it.
+fn write_int32_col<W: Write>(
+    w: &mut W,
+    offset: &mut i64,
+    num_rows: usize,
+    vals: &[u8],
+    spec: &'static ColSpec<'static>,
+    ds: &mut DictScratch,
+) -> io::Result<ChunkMeta<'static>> {
+    if !ds.build(vals) {
+        return write_col_page(w, offset, num_rows, vals, spec);
+    }
+    ds.encode_indices();
+    ds.dict_bytes.clear();
+    for &v in &ds.dict {
+        ds.dict_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let dict_off = *offset;
+    let dh = encode_dict_page_header(ds.dict.len() as i32, ds.dict_bytes.len() as i32);
+    w.write_all(&dh)?;
+    w.write_all(&ds.dict_bytes)?;
+    let dict_size = (dh.len() + ds.dict_bytes.len()) as i64;
+    let data_off = dict_off + dict_size;
+    let ph = encode_data_page_header_enc(num_rows as i32, ds.data.len() as i32, 2);
+    w.write_all(&ph)?;
+    w.write_all(&ds.data)?;
+    let total_size = dict_size + (ph.len() + ds.data.len()) as i64;
+    *offset += total_size;
+    ds.clear_slots();
+    Ok(ChunkMeta {
+        spec,
+        dict_page_offset: Some(dict_off),
+        data_page_offset: data_off,
         total_size,
         num_values: num_rows as i64,
     })
@@ -410,6 +579,7 @@ pub struct UserDailyWriter<'a> {
     cat_cur_byte: u8,
     cat_vals_buf: Vec<u8>,
     def_enc_scratch: Vec<u8>,
+    dict: DictScratch,
 }
 
 impl<'a> UserDailyWriter<'a> {
@@ -431,6 +601,7 @@ impl<'a> UserDailyWriter<'a> {
             cat_cur_byte: 0,
             cat_vals_buf: Vec::with_capacity(1 << 18),
             def_enc_scratch: Vec::with_capacity(ROW_GROUP_ROWS.div_ceil(8) + 2048),
+            dict: DictScratch::new(),
         }
     }
 
@@ -499,9 +670,10 @@ impl<'a> UserDailyWriter<'a> {
         let rg_offset = self.offset;
         let mut chunks = Vec::with_capacity(6);
         chunks.push(write_col_page(w, &mut self.offset, n, &self.user_id_buf, &USER_SCHEMA[0])?);
-        chunks.push(write_col_page(w, &mut self.offset, n, &self.day_buf, &USER_SCHEMA[1])?);
-        chunks.push(write_col_page(w, &mut self.offset, n, &self.sessions_buf, &USER_SCHEMA[2])?);
-        chunks.push(write_col_page(w, &mut self.offset, n, &self.events_buf, &USER_SCHEMA[3])?);
+        let ds = &mut self.dict;
+        chunks.push(write_int32_col(w, &mut self.offset, n, &self.day_buf, &USER_SCHEMA[1], ds)?);
+        chunks.push(write_int32_col(w, &mut self.offset, n, &self.sessions_buf, &USER_SCHEMA[2], ds)?);
+        chunks.push(write_int32_col(w, &mut self.offset, n, &self.events_buf, &USER_SCHEMA[3], ds)?);
         chunks.push(write_col_page(w, &mut self.offset, n, &self.rev_buf, &USER_SCHEMA[4])?);
         chunks.push(write_opt_col_page(
             w,
