@@ -42,6 +42,7 @@ struct Config {
     timing: bool,
     links_legacy: bool,
     overlap: bool,
+    click_overlap: bool,
     bitfilter_bits: u32,
     use_tickets: bool,
     ticket_loc_max: u32,
@@ -76,6 +77,7 @@ impl Config {
             timing: env_bool("TIMING", false),
             links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
             overlap: env_bool("SHOP_OVERLAP", true),
+            click_overlap: env_bool("SHOP_CLICK_OVERLAP", true),
             use_tickets: env_bool("SHOP_TICKETS", true),
             // Test-only: SHOP_TICKET_LOC_MAX forces the per-worker payload index overflow fallback.
             ticket_loc_max: env::var("SHOP_TICKET_LOC_MAX")
@@ -2353,27 +2355,59 @@ fn main() -> io::Result<()> {
         (links, ms_links, events_out, ms_events_io)
     };
 
-    // Phase 2: dedup -> link resolve -> scatter to 256 person shards (ticket path or legacy).
-    let t2 = Instant::now();
-    let pe_workers = match events_out {
-        EventsOut::Legacy(ev) => dedup_route_legacy(ev, &links, ncpu, cfg),
-        EventsOut::Tickets(tk, pl) => dedup_route_tickets(tk, pl, &links, ncpu, cfg),
+    // Phase 2: dedup is independent of click parsing after links are built. Both pools stay
+    // bounded by NCPU on the fixed CPU quota; SHOP_CLICK_OVERLAP=0 preserves the old order.
+    let (pe_workers, person_click_shards, ms_dedup, ms_clicks) = if cfg.click_overlap {
+        let t2 = Instant::now();
+        let (pe_workers, (click_result, ms_clicks), ms_dedup) = thread::scope(|s| {
+            let click_handle = s.spawn(|| {
+                let t3 = Instant::now();
+                let result = (|| -> io::Result<WorkerMatrix<PersonClick>> {
+                    let click_files = list_csvs(&data_dir.join("clicks"))?;
+                    read_clicks_parallel(
+                        &click_files,
+                        ncpu,
+                        cfg,
+                        base_ts,
+                        window_end,
+                        &campaigns,
+                        &links,
+                    )
+                })();
+                (result, t3.elapsed().as_secs_f64() * 1000.0)
+            });
+            let pe_workers = match events_out {
+                EventsOut::Legacy(ev) => dedup_route_legacy(ev, &links, ncpu, cfg),
+                EventsOut::Tickets(tk, pl) => dedup_route_tickets(tk, pl, &links, ncpu, cfg),
+            };
+            let ms_dedup = t2.elapsed().as_secs_f64() * 1000.0;
+            (pe_workers, click_handle.join().unwrap(), ms_dedup)
+        });
+        let person_click_shards = click_result?;
+        (pe_workers, person_click_shards, ms_dedup, ms_clicks)
+    } else {
+        let t2 = Instant::now();
+        let pe_workers = match events_out {
+            EventsOut::Legacy(ev) => dedup_route_legacy(ev, &links, ncpu, cfg),
+            EventsOut::Tickets(tk, pl) => dedup_route_tickets(tk, pl, &links, ncpu, cfg),
+        };
+        let ms_dedup = t2.elapsed().as_secs_f64() * 1000.0;
+
+        let t3 = Instant::now();
+        let click_files = list_csvs(&data_dir.join("clicks"))?;
+        let person_click_shards = read_clicks_parallel(
+            &click_files,
+            ncpu,
+            cfg,
+            base_ts,
+            window_end,
+            &campaigns,
+            &links,
+        )?;
+        let ms_clicks = t3.elapsed().as_secs_f64() * 1000.0;
+        (pe_workers, person_click_shards, ms_dedup, ms_clicks)
     };
     let person_event_shards = WorkerMatrix::new(pe_workers);
-    let ms_dedup = t2.elapsed().as_secs_f64() * 1000.0;
-
-    let t3 = Instant::now();
-    let click_files = list_csvs(&data_dir.join("clicks"))?;
-    let person_click_shards = read_clicks_parallel(
-        &click_files,
-        ncpu,
-        cfg,
-        base_ts,
-        window_end,
-        &campaigns,
-        &links,
-    )?;
-    let ms_clicks = t3.elapsed().as_secs_f64() * 1000.0;
 
     fs::create_dir_all(out_dir.join("user_daily"))?;
 
