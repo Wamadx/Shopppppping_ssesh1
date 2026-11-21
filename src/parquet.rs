@@ -4,15 +4,6 @@ use std::path::Path;
 
 use crate::csv_ts::Key;
 
-pub struct UserDailyRow {
-    pub user_id: Key,
-    pub day: i32,
-    pub sessions: i32,
-    pub events: i32,
-    pub revenue_cents: i64,
-    pub top_category: u16, // u16::MAX means null
-}
-
 pub struct CampaignDailyRow {
     pub campaign_id_idx: u16,
     pub day: i32,
@@ -173,29 +164,20 @@ fn encode_data_page_header(num_values: i32, payload_len: i32) -> Vec<u8> {
     t.0
 }
 
-fn encode_def_levels_bitpacked(present: &[bool], out: &mut Vec<u8>) {
-    let len_pos = out.len();
-    out.extend_from_slice(&[0u8; 4]);
+fn encode_def_levels_from_bitmap(bitmap: &[u8], num_rows: usize, out: &mut Vec<u8>) {
+    let total_bytes = num_rows.div_ceil(8);
+    let num_rle_headers = total_bytes.div_ceil(63);
+    let stream_len = total_bytes + num_rle_headers;
+    out.extend_from_slice(&(stream_len as u32).to_le_bytes());
     let mut idx = 0usize;
-    while idx < present.len() {
-        let chunk_end = (idx + 504).min(present.len());
-        let count = chunk_end - idx;
-        let num_groups = count.div_ceil(8);
+    let slice = &bitmap[..total_bytes];
+    while idx < slice.len() {
+        let chunk_end = (idx + 63).min(slice.len());
+        let num_groups = chunk_end - idx;
         out.push(((num_groups as u8) << 1) | 1);
-        for g in 0..num_groups {
-            let mut byte = 0u8;
-            for b in 0..8 {
-                let pos = idx + g * 8 + b;
-                if pos < chunk_end && present[pos] {
-                    byte |= 1u8 << b;
-                }
-            }
-            out.push(byte);
-        }
+        out.extend_from_slice(&slice[idx..chunk_end]);
         idx = chunk_end;
     }
-    let level_bytes = (out.len() - len_pos - 4) as u32;
-    out[len_pos..len_pos + 4].copy_from_slice(&level_bytes.to_le_bytes());
 }
 
 struct ChunkMeta<'a> {
@@ -300,6 +282,30 @@ fn write_col_page<W: Write>(
     })
 }
 
+fn write_opt_col_page<W: Write>(
+    w: &mut W,
+    offset: &mut i64,
+    num_rows: usize,
+    def_hdr_and_bits: &[u8],
+    vals: &[u8],
+    spec: &'static ColSpec<'static>,
+) -> io::Result<ChunkMeta<'static>> {
+    let payload_len = def_hdr_and_bits.len() + vals.len();
+    let hdr = encode_data_page_header(num_rows as i32, payload_len as i32);
+    let page_offset = *offset;
+    w.write_all(&hdr)?;
+    w.write_all(def_hdr_and_bits)?;
+    w.write_all(vals)?;
+    let total_size = (hdr.len() + payload_len) as i64;
+    *offset += total_size;
+    Ok(ChunkMeta {
+        spec,
+        data_page_offset: page_offset,
+        total_size,
+        num_values: num_rows as i64,
+    })
+}
+
 const USER_SCHEMA: [ColSpec<'static>; 6] = [
     ColSpec {
         name: "user_id",
@@ -384,81 +390,161 @@ const CAMPAIGN_SCHEMA: [ColSpec<'static>; 7] = [
     },
 ];
 
-pub fn write_user_daily_part(
-    out_dir: &Path,
+const ROW_GROUP_ROWS: usize = 500_000;
+
+/// Direct columnar Parquet writer eliminating intermediate row structs and per-column re-iteration.
+pub struct UserDailyWriter<'a> {
+    w: Option<BufWriter<File>>,
+    out_dir: &'a Path,
     part_idx: usize,
-    rows: &[UserDailyRow],
-    categories: &[Box<[u8]>],
-) -> io::Result<()> {
-    let dir = out_dir.join("user_daily");
-    let path = dir.join(format!("part-{part_idx}.parquet"));
-    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
-    w.write_all(b"PAR1")?;
-    let mut offset = 4i64;
-    let mut row_groups = Vec::new();
-    let mut buf = Vec::with_capacity(1 << 20);
-    let mut present = Vec::with_capacity(500_000);
+    offset: i64,
+    total_rows: i64,
+    row_groups: Vec<RowGroupMeta<'static>>,
+    rg_rows: usize,
+    user_id_buf: Vec<u8>,
+    day_buf: Vec<u8>,
+    sessions_buf: Vec<u8>,
+    events_buf: Vec<u8>,
+    rev_buf: Vec<u8>,
+    cat_bitmap: Vec<u8>,
+    cat_cur_byte: u8,
+    cat_vals_buf: Vec<u8>,
+    def_enc_scratch: Vec<u8>,
+}
 
-    for chunk in rows.chunks(500_000) {
-        let rg_offset = offset;
-        let mut chunks = Vec::with_capacity(6);
-
-        buf.clear();
-        for r in chunk {
-            r.user_id.write_parquet_bytes(&mut buf);
+impl<'a> UserDailyWriter<'a> {
+    pub fn new(out_dir: &'a Path, part_idx: usize) -> Self {
+        Self {
+            w: None,
+            out_dir,
+            part_idx,
+            offset: 4,
+            total_rows: 0,
+            row_groups: Vec::new(),
+            rg_rows: 0,
+            user_id_buf: Vec::with_capacity(1 << 20),
+            day_buf: Vec::with_capacity(1 << 18),
+            sessions_buf: Vec::with_capacity(1 << 18),
+            events_buf: Vec::with_capacity(1 << 18),
+            rev_buf: Vec::with_capacity(1 << 19),
+            cat_bitmap: Vec::with_capacity(ROW_GROUP_ROWS.div_ceil(8) + 8),
+            cat_cur_byte: 0,
+            cat_vals_buf: Vec::with_capacity(1 << 18),
+            def_enc_scratch: Vec::with_capacity(ROW_GROUP_ROWS.div_ceil(8) + 2048),
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[0])?);
-
-        buf.clear();
-        for r in chunk {
-            buf.extend_from_slice(&r.day.to_le_bytes());
-        }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[1])?);
-
-        buf.clear();
-        for r in chunk {
-            buf.extend_from_slice(&r.sessions.to_le_bytes());
-        }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[2])?);
-
-        buf.clear();
-        for r in chunk {
-            buf.extend_from_slice(&r.events.to_le_bytes());
-        }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[3])?);
-
-        buf.clear();
-        for r in chunk {
-            buf.extend_from_slice(&r.revenue_cents.to_le_bytes());
-        }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[4])?);
-
-        buf.clear();
-        present.clear();
-        for r in chunk {
-            present.push(r.top_category != u16::MAX);
-        }
-        encode_def_levels_bitpacked(&present, &mut buf);
-        for r in chunk {
-            if r.top_category != u16::MAX {
-                let cat = &categories[r.top_category as usize];
-                buf.extend_from_slice(&(cat.len() as u32).to_le_bytes());
-                buf.extend_from_slice(cat);
-            }
-        }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[5])?);
-
-        let rg_bytes: i64 = chunks.iter().map(|c| c.total_size).sum();
-        row_groups.push(RowGroupMeta {
-            chunks,
-            total_byte_size: rg_bytes,
-            num_rows: chunk.len() as i64,
-            file_offset: rg_offset,
-        });
     }
 
-    write_file_metadata(&mut w, &USER_SCHEMA, rows.len() as i64, &row_groups)?;
-    w.flush()
+    fn ensure_file(&mut self) -> io::Result<()> {
+        if self.w.is_none() {
+            let path = self
+                .out_dir
+                .join("user_daily")
+                .join(format!("part-{}.parquet", self.part_idx));
+            let mut bw = BufWriter::with_capacity(1 << 20, File::create(path)?);
+            bw.write_all(b"PAR1")?;
+            self.w = Some(bw);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn push(
+        &mut self,
+        user_id: Key,
+        day: i32,
+        sessions: i32,
+        events: i32,
+        revenue_cents: i64,
+        top_category: u16,
+        categories: &[Box<[u8]>],
+    ) {
+        user_id.write_parquet_bytes(&mut self.user_id_buf);
+        self.day_buf.extend_from_slice(&day.to_le_bytes());
+        self.sessions_buf.extend_from_slice(&sessions.to_le_bytes());
+        self.events_buf.extend_from_slice(&events.to_le_bytes());
+        self.rev_buf.extend_from_slice(&revenue_cents.to_le_bytes());
+
+        let bit_pos = self.rg_rows & 7;
+        if top_category != u16::MAX {
+            self.cat_cur_byte |= 1u8 << bit_pos;
+            let cat = &categories[top_category as usize];
+            self.cat_vals_buf
+                .extend_from_slice(&(cat.len() as u32).to_le_bytes());
+            self.cat_vals_buf.extend_from_slice(cat);
+        }
+        if bit_pos == 7 {
+            self.cat_bitmap.push(self.cat_cur_byte);
+            self.cat_cur_byte = 0;
+        }
+        self.rg_rows += 1;
+        if self.rg_rows == ROW_GROUP_ROWS {
+            self.flush_row_group().expect("failed to flush user_daily row group");
+        }
+    }
+
+    fn flush_row_group(&mut self) -> io::Result<()> {
+        if self.rg_rows == 0 {
+            return Ok(());
+        }
+        self.ensure_file()?;
+        if (self.rg_rows & 7) != 0 {
+            self.cat_bitmap.push(self.cat_cur_byte);
+            self.cat_cur_byte = 0;
+        }
+        let n = self.rg_rows;
+        self.def_enc_scratch.clear();
+        encode_def_levels_from_bitmap(&self.cat_bitmap, n, &mut self.def_enc_scratch);
+
+        let w = self.w.as_mut().unwrap();
+        let rg_offset = self.offset;
+        let mut chunks = Vec::with_capacity(6);
+        chunks.push(write_col_page(w, &mut self.offset, n, &self.user_id_buf, &USER_SCHEMA[0])?);
+        chunks.push(write_col_page(w, &mut self.offset, n, &self.day_buf, &USER_SCHEMA[1])?);
+        chunks.push(write_col_page(w, &mut self.offset, n, &self.sessions_buf, &USER_SCHEMA[2])?);
+        chunks.push(write_col_page(w, &mut self.offset, n, &self.events_buf, &USER_SCHEMA[3])?);
+        chunks.push(write_col_page(w, &mut self.offset, n, &self.rev_buf, &USER_SCHEMA[4])?);
+        chunks.push(write_opt_col_page(
+            w,
+            &mut self.offset,
+            n,
+            &self.def_enc_scratch,
+            &self.cat_vals_buf,
+            &USER_SCHEMA[5],
+        )?);
+
+        let rg_bytes: i64 = chunks.iter().map(|c| c.total_size).sum();
+        self.row_groups.push(RowGroupMeta {
+            chunks,
+            total_byte_size: rg_bytes,
+            num_rows: n as i64,
+            file_offset: rg_offset,
+        });
+        self.total_rows += n as i64;
+        self.rg_rows = 0;
+        self.user_id_buf.clear();
+        self.day_buf.clear();
+        self.sessions_buf.clear();
+        self.events_buf.clear();
+        self.rev_buf.clear();
+        self.cat_bitmap.clear();
+        self.cat_vals_buf.clear();
+        Ok(())
+    }
+
+    pub fn finish(mut self, force_write_empty: bool) -> io::Result<()> {
+        if self.rg_rows > 0 {
+            self.flush_row_group()?;
+        }
+        if self.w.is_none() {
+            if !force_write_empty {
+                return Ok(());
+            }
+            self.ensure_file()?;
+        }
+        let w = self.w.as_mut().unwrap();
+        write_file_metadata(w, &USER_SCHEMA, self.total_rows, &self.row_groups)?;
+        w.flush()
+    }
 }
 
 pub fn write_campaign_daily(
@@ -474,51 +560,97 @@ pub fn write_campaign_daily(
     let mut row_groups = Vec::new();
     let mut buf = Vec::with_capacity(1 << 20);
 
-    for chunk in rows.chunks(500_000) {
+    for chunk in rows.chunks(ROW_GROUP_ROWS) {
         let rg_offset = offset;
         let mut chunks = Vec::with_capacity(7);
 
         buf.clear();
         for r in chunk {
-            campaigns[r.campaign_id_idx as usize].0.write_parquet_bytes(&mut buf);
+            campaigns[r.campaign_id_idx as usize]
+                .0
+                .write_parquet_bytes(&mut buf);
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[0])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[0],
+        )?);
 
         buf.clear();
         for r in chunk {
-            campaigns[r.campaign_id_idx as usize].1.write_parquet_bytes(&mut buf);
+            campaigns[r.campaign_id_idx as usize]
+                .1
+                .write_parquet_bytes(&mut buf);
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[1])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[1],
+        )?);
 
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.day.to_le_bytes());
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[2])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[2],
+        )?);
 
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.sessions.to_le_bytes());
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[3])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[3],
+        )?);
 
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.purchasing_sessions.to_le_bytes());
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[4])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[4],
+        )?);
 
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.revenue_cents.to_le_bytes());
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[5])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[5],
+        )?);
 
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.assisted_sessions.to_le_bytes());
         }
-        chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[6])?);
+        chunks.push(write_col_page(
+            &mut w,
+            &mut offset,
+            chunk.len(),
+            &buf,
+            &CAMPAIGN_SCHEMA[6],
+        )?);
 
         let rg_bytes: i64 = chunks.iter().map(|c| c.total_size).sum();
         row_groups.push(RowGroupMeta {
