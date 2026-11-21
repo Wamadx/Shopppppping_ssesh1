@@ -2,13 +2,13 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::csv_ts::SmallStr;
+use crate::csv_ts::Key;
 
 pub struct UserDailyRow {
-    pub user_id: SmallStr,
+    pub user_id: Key,
     pub day: i32,
-    pub sessions: i64,
-    pub events: i64,
+    pub sessions: i32,
+    pub events: i32,
     pub revenue_cents: i64,
     pub top_category: u16, // u16::MAX means null
 }
@@ -16,13 +16,12 @@ pub struct UserDailyRow {
 pub struct CampaignDailyRow {
     pub campaign_id_idx: u16,
     pub day: i32,
-    pub sessions: i64,
-    pub purchasing_sessions: i64,
+    pub sessions: i32,
+    pub purchasing_sessions: i32,
     pub revenue_cents: i64,
-    pub assisted_sessions: i64,
+    pub assisted_sessions: i32,
 }
 
-// Thrift Compact Protocol encoder
 struct ThriftBuf(Vec<u8>);
 
 impl ThriftBuf {
@@ -138,17 +137,17 @@ fn write_schema_element(buf: &mut ThriftBuf, col: &ColSpec<'_>) {
     match col.converted {
         Converted::Utf8 => {
             buf.i32_field(&mut last, 6, 0);
-            buf.field_hdr(&mut last, 10, 12); // logicalType
+            buf.field_hdr(&mut last, 10, 12);
             let mut llast = 0i16;
-            buf.field_hdr(&mut llast, 1, 12); // STRING
+            buf.field_hdr(&mut llast, 1, 12);
             buf.stop();
             buf.stop();
         }
         Converted::Date => {
             buf.i32_field(&mut last, 6, 6);
-            buf.field_hdr(&mut last, 10, 12); // logicalType
+            buf.field_hdr(&mut last, 10, 12);
             let mut llast = 0i16;
-            buf.field_hdr(&mut llast, 6, 12); // DATE
+            buf.field_hdr(&mut llast, 6, 12);
             buf.stop();
             buf.stop();
         }
@@ -160,15 +159,15 @@ fn write_schema_element(buf: &mut ThriftBuf, col: &ColSpec<'_>) {
 fn encode_data_page_header(num_values: i32, payload_len: i32) -> Vec<u8> {
     let mut t = ThriftBuf::new();
     let mut last = 0i16;
-    t.i32_field(&mut last, 1, 0); // PageType::DATA_PAGE
+    t.i32_field(&mut last, 1, 0);
     t.i32_field(&mut last, 2, payload_len);
     t.i32_field(&mut last, 3, payload_len);
-    t.field_hdr(&mut last, 5, 12); // data_page_header
+    t.field_hdr(&mut last, 5, 12);
     let mut dlast = 0i16;
     t.i32_field(&mut dlast, 1, num_values);
-    t.i32_field(&mut dlast, 2, 0); // PLAIN
-    t.i32_field(&mut dlast, 3, 3); // RLE
-    t.i32_field(&mut dlast, 4, 3); // RLE
+    t.i32_field(&mut dlast, 2, 0);
+    t.i32_field(&mut dlast, 3, 3);
+    t.i32_field(&mut dlast, 4, 3);
     t.stop();
     t.stop();
     t.0
@@ -221,9 +220,8 @@ fn write_file_metadata<W: Write>(
 ) -> io::Result<()> {
     let mut t = ThriftBuf::new();
     let mut last = 0i16;
-    t.i32_field(&mut last, 1, 1); // version = 1
+    t.i32_field(&mut last, 1, 1);
 
-    // 2: schema
     t.list_hdr(&mut last, 2, 12, schema.len() + 1);
     {
         let mut rlast = 0i16;
@@ -235,10 +233,8 @@ fn write_file_metadata<W: Write>(
         write_schema_element(&mut t, col);
     }
 
-    // 3: num_rows
     t.i64_field(&mut last, 3, total_rows);
 
-    // 4: row_groups
     t.list_hdr(&mut last, 4, 12, row_groups.len());
     for (rg_idx, rg) in row_groups.iter().enumerate() {
         let mut rlast = 0i16;
@@ -246,18 +242,18 @@ fn write_file_metadata<W: Write>(
         for ch in &rg.chunks {
             let mut clast = 0i16;
             t.i64_field(&mut clast, 2, ch.data_page_offset);
-            t.field_hdr(&mut clast, 3, 12); // ColumnMetaData
+            t.field_hdr(&mut clast, 3, 12);
             {
                 let mut mlast = 0i16;
                 t.i32_field(&mut mlast, 1, ch.spec.ty as i32);
-                t.list_hdr(&mut mlast, 2, 5, 2); // encodings
-                t.zz32(0); // PLAIN
-                t.zz32(3); // RLE
-                t.list_hdr(&mut mlast, 3, 8, 1); // path_in_schema
+                t.list_hdr(&mut mlast, 2, 5, 2);
+                t.zz32(0);
+                t.zz32(3);
+                t.list_hdr(&mut mlast, 3, 8, 1);
                 let name = ch.spec.name.as_bytes();
                 t.uvarint(name.len() as u64);
                 t.0.extend_from_slice(name);
-                t.i32_field(&mut mlast, 4, 0); // UNCOMPRESSED
+                t.i32_field(&mut mlast, 4, 0);
                 t.i64_field(&mut mlast, 5, ch.num_values);
                 t.i64_field(&mut mlast, 6, ch.total_size);
                 t.i64_field(&mut mlast, 7, ch.total_size);
@@ -319,13 +315,13 @@ const USER_SCHEMA: [ColSpec<'static>; 6] = [
     },
     ColSpec {
         name: "sessions",
-        ty: ColType::Int64,
+        ty: ColType::Int32,
         optional: false,
         converted: Converted::None,
     },
     ColSpec {
         name: "events",
-        ty: ColType::Int64,
+        ty: ColType::Int32,
         optional: false,
         converted: Converted::None,
     },
@@ -364,13 +360,13 @@ const CAMPAIGN_SCHEMA: [ColSpec<'static>; 7] = [
     },
     ColSpec {
         name: "sessions",
-        ty: ColType::Int64,
+        ty: ColType::Int32,
         optional: false,
         converted: Converted::None,
     },
     ColSpec {
         name: "purchasing_sessions",
-        ty: ColType::Int64,
+        ty: ColType::Int32,
         optional: false,
         converted: Converted::None,
     },
@@ -382,20 +378,21 @@ const CAMPAIGN_SCHEMA: [ColSpec<'static>; 7] = [
     },
     ColSpec {
         name: "assisted_sessions",
-        ty: ColType::Int64,
+        ty: ColType::Int32,
         optional: false,
         converted: Converted::None,
     },
 ];
 
-pub fn write_user_daily(
+pub fn write_user_daily_part(
     out_dir: &Path,
+    part_idx: usize,
     rows: &[UserDailyRow],
     categories: &[Box<[u8]>],
 ) -> io::Result<()> {
     let dir = out_dir.join("user_daily");
-    fs::create_dir_all(&dir)?;
-    let mut w = BufWriter::with_capacity(1 << 20, File::create(dir.join("part-0.parquet"))?);
+    let path = dir.join(format!("part-{part_idx}.parquet"));
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     w.write_all(b"PAR1")?;
     let mut offset = 4i64;
     let mut row_groups = Vec::new();
@@ -406,44 +403,36 @@ pub fn write_user_daily(
         let rg_offset = offset;
         let mut chunks = Vec::with_capacity(6);
 
-        // 0: user_id
         buf.clear();
         for r in chunk {
-            let b = r.user_id.as_bytes();
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
+            r.user_id.write_parquet_bytes(&mut buf);
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[0])?);
 
-        // 1: day
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.day.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[1])?);
 
-        // 2: sessions
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.sessions.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[2])?);
 
-        // 3: events
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.events.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[3])?);
 
-        // 4: revenue_cents
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.revenue_cents.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &USER_SCHEMA[4])?);
 
-        // 5: top_category (nullable)
         buf.clear();
         present.clear();
         for r in chunk {
@@ -475,7 +464,7 @@ pub fn write_user_daily(
 pub fn write_campaign_daily(
     out_dir: &Path,
     rows: &[CampaignDailyRow],
-    campaigns: &[(SmallStr, SmallStr)],
+    campaigns: &[(Key, Key)],
 ) -> io::Result<()> {
     let dir = out_dir.join("campaign_daily");
     fs::create_dir_all(&dir)?;
@@ -489,53 +478,42 @@ pub fn write_campaign_daily(
         let rg_offset = offset;
         let mut chunks = Vec::with_capacity(7);
 
-        // 0: campaign_id
         buf.clear();
         for r in chunk {
-            let b = campaigns[r.campaign_id_idx as usize].0.as_bytes();
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
+            campaigns[r.campaign_id_idx as usize].0.write_parquet_bytes(&mut buf);
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[0])?);
 
-        // 1: channel
         buf.clear();
         for r in chunk {
-            let b = campaigns[r.campaign_id_idx as usize].1.as_bytes();
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
+            campaigns[r.campaign_id_idx as usize].1.write_parquet_bytes(&mut buf);
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[1])?);
 
-        // 2: day
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.day.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[2])?);
 
-        // 3: sessions
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.sessions.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[3])?);
 
-        // 4: purchasing_sessions
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.purchasing_sessions.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[4])?);
 
-        // 5: revenue_cents
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.revenue_cents.to_le_bytes());
         }
         chunks.push(write_col_page(&mut w, &mut offset, chunk.len(), &buf, &CAMPAIGN_SCHEMA[5])?);
 
-        // 6: assisted_sessions
         buf.clear();
         for r in chunk {
             buf.extend_from_slice(&r.assisted_sessions.to_le_bytes());

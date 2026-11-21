@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
+const INTERNED_BIT: u64 = 1u64 << 63;
+
 #[derive(Default)]
 struct Interner {
     map: HashMap<&'static [u8], u32>,
@@ -13,86 +15,97 @@ fn interner() -> &'static RwLock<Interner> {
     INTERNER.get_or_init(|| RwLock::new(Interner::default()))
 }
 
-/// Compact 16-byte string representation.
-/// Length <= 15 is stored inline (`bytes[15] = len`), otherwise `bytes[15] = 0xFF`
-/// and `bytes[0..4]` stores the `u32` index into the global interner.
+/// 8-byte order-preserving ID key.
+/// - Bit 63 == 0: 1..=9 ASCII bytes in 0x01..=0x7F packed 7 bits/char MSB-first.
+///   Integer `<` equals byte-wise lexicographical `<`.
+/// - Bit 63 == 1: interned in global `INTERNER` (for len > 9, len == 0, NUL, or non-ASCII).
+/// - `Key(0)` is `EMPTY` sentinel (never produced by `from_bytes`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct SmallStr(pub [u8; 16]);
+pub struct Key(pub u64);
 
-impl SmallStr {
-    pub const EMPTY: Self = Self([0u8; 16]);
+impl Key {
+    pub const EMPTY: Self = Self(0);
 
     #[inline]
     pub fn from_bytes(s: &[u8]) -> Self {
-        if s.len() <= 15 {
-            let mut buf = [0u8; 16];
-            buf[..s.len()].copy_from_slice(s);
-            buf[15] = s.len() as u8;
-            Self(buf)
-        } else {
-            Self::intern_long(s)
+        let len = s.len();
+        if len >= 1 && len <= 9 {
+            let mut acc = 0u64;
+            let mut shift = 56i32;
+            let mut i = 0usize;
+            while i < len {
+                let b = s[i];
+                if b == 0 || b >= 0x80 {
+                    return Self::intern_slow(s);
+                }
+                acc |= (b as u64) << shift;
+                shift -= 7;
+                i += 1;
+            }
+            return Self(acc);
         }
+        Self::intern_slow(s)
     }
 
     #[cold]
-    fn intern_long(s: &[u8]) -> Self {
+    fn intern_slow(s: &[u8]) -> Self {
         let lock = interner();
         {
             let r = lock.read().unwrap();
             if let Some(&idx) = r.map.get(s) {
-                return Self::from_long_idx(idx);
+                return Self(INTERNED_BIT | (idx as u64));
             }
         }
         let mut w = lock.write().unwrap();
         if let Some(&idx) = w.map.get(s) {
-            return Self::from_long_idx(idx);
+            return Self(INTERNED_BIT | (idx as u64));
         }
         let idx = w.slices.len() as u32;
         let leaked: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
         w.slices.push(leaked);
         w.map.insert(leaked, idx);
-        Self::from_long_idx(idx)
+        Self(INTERNED_BIT | (idx as u64))
     }
 
     #[inline]
-    fn from_long_idx(idx: u32) -> Self {
-        let mut buf = [0u8; 16];
-        buf[0..4].copy_from_slice(&idx.to_le_bytes());
-        buf[15] = 0xFF;
-        Self(buf)
-    }
-
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        let tag = self.0[15];
-        if tag != 0xFF {
-            &self.0[..tag as usize]
-        } else {
-            self.as_long_bytes()
+    pub fn unpack_inline(self, buf: &mut [u8; 9]) -> usize {
+        let mut v = self.0;
+        let mut len = 0usize;
+        while len < 9 {
+            let b = ((v >> 56) & 0x7f) as u8;
+            if b == 0 {
+                break;
+            }
+            buf[len] = b;
+            len += 1;
+            v <<= 7;
         }
+        len
     }
 
     #[cold]
-    fn as_long_bytes(&self) -> &'static [u8] {
-        let idx = u32::from_le_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) as usize;
+    fn long_bytes(self) -> &'static [u8] {
+        let idx = (self.0 & !INTERNED_BIT) as usize;
         interner().read().unwrap().slices[idx]
     }
 
     #[inline]
-    pub fn as_u128(self) -> u128 {
-        u128::from_ne_bytes(self.0)
+    pub fn write_parquet_bytes(self, out: &mut Vec<u8>) {
+        if (self.0 & INTERNED_BIT) == 0 {
+            let mut buf = [0u8; 9];
+            let len = self.unpack_inline(&mut buf);
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+            out.extend_from_slice(&buf[..len]);
+        } else {
+            let s = self.long_bytes();
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s);
+        }
     }
 
     #[inline]
     pub fn hash64(self) -> u64 {
-        let lo = u64::from_ne_bytes([
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], self.0[6], self.0[7],
-        ]);
-        let hi = u64::from_ne_bytes([
-            self.0[8], self.0[9], self.0[10], self.0[11], self.0[12], self.0[13], self.0[14],
-            self.0[15],
-        ]);
-        let mut x = lo ^ hi.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut x = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^ (x >> 31)
@@ -100,23 +113,64 @@ impl SmallStr {
 
     #[inline]
     pub fn cmp_bytes(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_bytes().cmp(other.as_bytes())
+        if ((self.0 | other.0) & INTERNED_BIT) == 0 {
+            self.0.cmp(&other.0)
+        } else {
+            self.cmp_bytes_slow(other)
+        }
+    }
+
+    #[cold]
+    fn cmp_bytes_slow(&self, other: &Self) -> std::cmp::Ordering {
+        let mut a_buf = [0u8; 9];
+        let mut b_buf = [0u8; 9];
+        let a_slice: &[u8] = if (self.0 & INTERNED_BIT) == 0 {
+            let n = self.unpack_inline(&mut a_buf);
+            &a_buf[..n]
+        } else {
+            self.long_bytes()
+        };
+        let b_slice: &[u8] = if (other.0 & INTERNED_BIT) == 0 {
+            let n = other.unpack_inline(&mut b_buf);
+            &b_buf[..n]
+        } else {
+            other.long_bytes()
+        };
+        a_slice.cmp(b_slice)
     }
 }
 
-/// Parses an exact N-field CSV line according to `rules.md`:
-/// - Empty line is malformed.
-/// - Every comma separates fields.
-/// - Any field wrapped in `"` strips outer quotes; quotes anywhere else are malformed.
+/// Parses an exact N-field CSV line according to `rules.md`.
 #[inline]
 pub fn parse_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     if line.is_empty() {
         return None;
     }
+    let has_quote = line.contains(&b'"');
     let mut out = [&[][..]; N];
     let mut start = 0usize;
     let mut idx = 0usize;
     let len = line.len();
+
+    if !has_quote {
+        let mut i = 0usize;
+        while i < len {
+            if line[i] == b',' {
+                if idx + 1 >= N {
+                    return None;
+                }
+                out[idx] = &line[start..i];
+                idx += 1;
+                start = i + 1;
+            }
+            i += 1;
+        }
+        if idx + 1 != N {
+            return None;
+        }
+        out[idx] = &line[start..len];
+        return Some(out);
+    }
 
     let mut i = 0usize;
     while i < len {
@@ -198,6 +252,91 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
+#[derive(Clone, Copy)]
+struct DateEntry {
+    k0: u64,
+    k1: u16,
+    day_ms: i64, // i64::MIN = empty/invalid
+}
+
+pub struct DateCache {
+    entries: [DateEntry; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        Self {
+            entries: [DateEntry {
+                k0: u64::MAX,
+                k1: u16::MAX,
+                day_ms: i64::MIN,
+            }; 64],
+        }
+    }
+
+    #[inline]
+    pub fn parse_ts(&mut self, s: &[u8]) -> Option<i64> {
+        let len = s.len();
+        if len == 20 && s[19] == b'Z' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
+            let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
+            let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
+            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> 58) as usize;
+            let ent = &self.entries[slot];
+            let day_ms = if ent.k0 == k0 && ent.k1 == k1 {
+                if ent.day_ms == i64::MIN {
+                    return None;
+                }
+                ent.day_ms
+            } else {
+                let d = parse_date_10(&s[0..10]);
+                self.entries[slot] = DateEntry {
+                    k0,
+                    k1,
+                    day_ms: d.unwrap_or(i64::MIN),
+                };
+                d?
+            };
+            let hour = parse_2(s[11], s[12])?;
+            let minute = parse_2(s[14], s[15])?;
+            let second = parse_2(s[17], s[18])?;
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            return Some(day_ms + (hour * 3_600 + minute * 60 + second) * 1_000);
+        }
+        parse_ts(s)
+    }
+}
+
+#[inline]
+fn parse_date_10(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let year = parse_4(&s[0..4])?;
+    let month = parse_2(s[5], s[6])?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let day = parse_2(s[8], s[9])?;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400_000)
+}
+
 /// Parses timestamps in forms F1, F2, and F3 into epoch milliseconds UTC.
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
@@ -206,45 +345,20 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
         return None;
     }
 
-    // F1: YYYY-MM-DDTHH:MM:SSZ (20 bytes)
-    // F2: YYYY-MM-DDTHH:MM:SS+HH:MM or -HH:MM (25 bytes)
     if (len == 20 && s[19] == b'Z')
         || (len == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':')
     {
-        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
             return None;
         }
-        let year = parse_4(&s[0..4])?;
-        let month = parse_2(s[5], s[6])?;
-        if !(1..=12).contains(&month) {
-            return None;
-        }
-        let day = parse_2(s[8], s[9])?;
-        let max_day = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 => {
-                if is_leap_year(year) {
-                    29
-                } else {
-                    28
-                }
-            }
-            _ => return None,
-        };
-        if !(1..=max_day).contains(&day) {
-            return None;
-        }
+        let day_ms = parse_date_10(&s[0..10])?;
         let hour = parse_2(s[11], s[12])?;
         let minute = parse_2(s[14], s[15])?;
         let second = parse_2(s[17], s[18])?;
         if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
-
-        let mut ms = days_from_civil(year, month, day) * 86_400_000
-            + (hour * 3_600 + minute * 60 + second) * 1_000;
-
+        let mut ms = day_ms + (hour * 3_600 + minute * 60 + second) * 1_000;
         if len == 25 {
             let off_h = parse_2(s[20], s[21])?;
             let off_m = parse_2(s[23], s[24])?;
@@ -261,7 +375,6 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
         return Some(ms);
     }
 
-    // F3: ASCII digits only (epoch milliseconds)
     if s.iter().all(|&b| b.is_ascii_digit()) {
         let mut val: i64 = 0;
         for &b in s {

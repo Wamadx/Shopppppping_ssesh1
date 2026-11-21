@@ -2,7 +2,7 @@ FROM rust:1.93-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-cpu=cascadelake"
 RUN cargo build --release
 
 FROM debian:bookworm-slim
