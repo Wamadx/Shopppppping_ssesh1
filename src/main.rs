@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -28,8 +28,7 @@ const DEDUP_SHIFT: u32 = 55; // 64 - 9
 const NUM_PERSON_SHARDS: usize = 256;
 const PERSON_SHIFT: u32 = 56; // 64 - 8
 
-const BITFILTER_BITS: usize = 1 << 24; // 2 MiB
-const BITFILTER_MASK: usize = BITFILTER_BITS - 1;
+const BITFILTER_BITS_DEFAULT: u32 = 24; // 2 MiB
 
 #[derive(Clone, Copy)]
 struct Config {
@@ -39,6 +38,9 @@ struct Config {
     use_prefetch: bool,
     use_dedup_bitmap: bool,
     timing: bool,
+    links_legacy: bool,
+    overlap: bool,
+    bitfilter_bits: u32,
 }
 
 impl Config {
@@ -67,6 +69,13 @@ impl Config {
             use_prefetch: env_bool("SHOP_PREFETCH", false),
             use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
             timing: env_bool("TIMING", false),
+            links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
+            overlap: env_bool("SHOP_OVERLAP", false),
+            bitfilter_bits: env::var("SHOP_BITFILTER_BITS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&b| (16..=28).contains(&b))
+                .unwrap_or(BITFILTER_BITS_DEFAULT),
         }
     }
 }
@@ -180,20 +189,40 @@ impl<V: Copy + Default> KeyMap<V> {
 }
 
 struct LinkTable {
-    map: KeyMap<Key>,
+    /// 1 map (legacy) or 8 hash-sharded maps (sort path); shard = top 3 hash bits.
+    maps: Vec<KeyMap<Key>>,
     non_canonical: Vec<u64>,
     use_bitfilter: bool,
+    mask: usize,
 }
 
 impl LinkTable {
+    fn empty() -> Self {
+        Self {
+            maps: vec![KeyMap::with_capacity(16)],
+            non_canonical: Vec::new(),
+            use_bitfilter: false,
+            mask: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn map_for(&self, h: u64) -> &KeyMap<Key> {
+        if self.maps.len() == 1 {
+            &self.maps[0]
+        } else {
+            unsafe { self.maps.get_unchecked((h >> 61) as usize) }
+        }
+    }
+
     #[inline(always)]
     fn prefetch(&self, uid: Key) {
         let h = uid.hash64();
         if self.use_bitfilter {
-            let bit = (h as usize) & BITFILTER_MASK;
+            let bit = (h as usize) & self.mask;
             prefetch_ro(self.non_canonical.as_ptr().wrapping_add(bit >> 6));
         } else {
-            self.map.prefetch_with_hash(h);
+            self.map_for(h).prefetch_with_hash(h);
         }
     }
 
@@ -201,7 +230,7 @@ impl LinkTable {
     fn resolve(&self, uid: Key, cache: &mut [(Key, Key); 1024]) -> Key {
         let h = uid.hash64();
         if self.use_bitfilter {
-            let bit = (h as usize) & BITFILTER_MASK;
+            let bit = (h as usize) & self.mask;
             let word = unsafe { *self.non_canonical.get_unchecked(bit >> 6) };
             if ((word >> (bit & 63)) & 1) == 0 {
                 return uid;
@@ -212,7 +241,7 @@ impl LinkTable {
         if entry.0 == uid {
             return entry.1;
         }
-        let resolved = self.map.get_with_hash(uid, h).unwrap_or(uid);
+        let resolved = self.map_for(h).get_with_hash(uid, h).unwrap_or(uid);
         cache[slot] = (uid, resolved);
         resolved
     }
@@ -674,15 +703,19 @@ impl UnionFind {
     }
 }
 
-fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) -> io::Result<LinkTable> {
+fn load_links_legacy(
+    dir: &Path,
+    ncpu: usize,
+    chunk_bytes: usize,
+    use_bitfilter: bool,
+    bitfilter_bits: u32,
+    timing: bool,
+) -> io::Result<LinkTable> {
+    let t_parse = Instant::now();
     let paths = list_csvs(dir)?;
     let (files, chunks) = plan_file_chunks(&paths, chunk_bytes)?;
     if chunks.is_empty() {
-        return Ok(LinkTable {
-            map: KeyMap::with_capacity(16),
-            non_canonical: Vec::new(),
-            use_bitfilter: false,
-        });
+        return Ok(LinkTable::empty());
     }
 
     let next_chunk = AtomicUsize::new(0);
@@ -713,7 +746,9 @@ fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) 
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(files);
+    let ms_parse = t_parse.elapsed().as_secs_f64() * 1000.0;
 
+    let t_union = Instant::now();
     let total_edges: usize = pairs_per_worker.iter().map(|v| v.len()).sum();
     let mut uf = UnionFind::new((total_edges * 2).max(64));
     for pv in &pairs_per_worker {
@@ -724,10 +759,17 @@ fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) 
         }
     }
     drop(pairs_per_worker);
+    let ms_union = t_union.elapsed().as_secs_f64() * 1000.0;
 
+    let t_build = Instant::now();
+    let mask = if use_bitfilter {
+        (1usize << bitfilter_bits) - 1
+    } else {
+        0
+    };
     let mut map = KeyMap::with_capacity(uf.ids.len().max(16));
     let mut non_canonical = if use_bitfilter {
-        vec![0u64; BITFILTER_BITS >> 6]
+        vec![0u64; (mask + 1) >> 6]
     } else {
         Vec::new()
     };
@@ -740,16 +782,510 @@ fn load_links(dir: &Path, ncpu: usize, chunk_bytes: usize, use_bitfilter: bool) 
             let h = uf.hashes[idx];
             map.insert_with_hash(id, h, min_id);
             if use_bitfilter {
-                let bit = (h as usize) & BITFILTER_MASK;
+                let bit = (h as usize) & mask;
                 non_canonical[bit >> 6] |= 1u64 << (bit & 63);
             }
         }
     }
+    if timing {
+        eprintln!(
+            "LINKS_SUB parse={:.1} union={:.1} build={:.1} nodes={} edges={}",
+            ms_parse,
+            ms_union,
+            t_build.elapsed().as_secs_f64() * 1000.0,
+            uf.ids.len(),
+            total_edges
+        );
+    }
     Ok(LinkTable {
-        map,
+        maps: vec![map],
         non_canonical,
         use_bitfilter,
+        mask,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Sort-based link pipeline: parallel radix interning (rank = byte order),
+// concurrent hook-to-smaller union-find, parallel sharded lookup-table build.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct EndRec {
+    key: u64,
+    refr: u32,
+}
+
+/// Shared write buffer: threads write provably disjoint elements (see callers).
+struct SharedBuf<T>(UnsafeCell<Vec<T>>);
+unsafe impl<T: Send> Sync for SharedBuf<T> {}
+
+#[inline(always)]
+fn range_of(n: usize, t: usize, tid: usize) -> (usize, usize) {
+    (n * tid / t, n * (tid + 1) / t)
+}
+
+/// Parallel stable LSD radix sort of `recs` by `key` (8-bit digits, constant
+/// digits skipped). Small inputs use a single-threaded unstable sort (equal
+/// keys are deduplicated later, so within-key order is irrelevant).
+fn radix_sort_recs(recs: &mut Vec<EndRec>, scratch: &mut Vec<EndRec>, ncpu: usize) {
+    let n = recs.len();
+    if n < 2 {
+        return;
+    }
+    let t = ncpu.min((n / 16384).max(1));
+    if t == 1 {
+        recs.sort_unstable_by_key(|r| r.key);
+        return;
+    }
+    let mut hist = vec![[0usize; 256]; t];
+    let mut offs = vec![[0usize; 256]; t];
+    let dst = SharedBuf(UnsafeCell::new(std::mem::take(scratch)));
+    for pass in 0..8u32 {
+        let shift = pass * 8;
+        thread::scope(|s| {
+            for (tid, h) in hist.iter_mut().enumerate() {
+                let (lo, hi) = range_of(n, t, tid);
+                let r = &*recs;
+                s.spawn(move || {
+                    h.fill(0);
+                    for rec in &r[lo..hi] {
+                        h[((rec.key >> shift) & 255) as usize] += 1;
+                    }
+                });
+            }
+        });
+        let mut total = [0usize; 256];
+        for h in &hist {
+            for b in 0..256 {
+                total[b] += h[b];
+            }
+        }
+        let mut nz = 0;
+        let mut run = 0usize;
+        for b in 0..256 {
+            if total[b] > 0 {
+                nz += 1;
+            }
+            for tid in 0..t {
+                offs[tid][b] = run;
+                run += hist[tid][b];
+            }
+        }
+        if nz <= 1 {
+            continue; // constant digit: scatter would be the identity
+        }
+        thread::scope(|s| {
+            for (tid, o) in offs.iter_mut().enumerate() {
+                let (lo, hi) = range_of(n, t, tid);
+                let r = &*recs;
+                let d = &dst;
+                s.spawn(move || {
+                    let w = unsafe { &mut *d.0.get() };
+                    let mut cur = *o;
+                    for rec in &r[lo..hi] {
+                        let b = ((rec.key >> shift) & 255) as usize;
+                        unsafe { *w.get_unchecked_mut(cur[b]) = *rec };
+                        cur[b] += 1;
+                    }
+                });
+            }
+        });
+        let src = unsafe { &mut *dst.0.get() };
+        std::mem::swap(recs, src);
+    }
+    *scratch = dst.0.into_inner();
+}
+
+/// Deduplicate sorted endpoint records; emit unique keys `u` (sorted by `key`)
+/// and `halves[ref] = rank`. Two parallel scans with a prefix-sum barrier.
+fn rank_recs(recs: &[EndRec], ncpu: usize) -> (Vec<u64>, Vec<u32>) {
+    let n = recs.len();
+    let t = ncpu.min((n / 16384).max(1));
+    let mut counts = vec![0usize; t];
+    thread::scope(|s| {
+        for (tid, c) in counts.iter_mut().enumerate() {
+            let (lo, hi) = range_of(n, t, tid);
+            s.spawn(move || {
+                let mut cnt = 0usize;
+                for i in lo..hi {
+                    if i == 0 || recs[i].key != recs[i - 1].key {
+                        cnt += 1;
+                    }
+                }
+                *c = cnt;
+            });
+        }
+    });
+    let mut offs = vec![0usize; t];
+    let mut total = 0usize;
+    for tid in 0..t {
+        offs[tid] = total;
+        total += counts[tid];
+    }
+    let ubuf = SharedBuf(UnsafeCell::new(vec![0u64; total]));
+    let hbuf = SharedBuf(UnsafeCell::new(vec![0u32; n]));
+    thread::scope(|s| {
+        for tid in 0..t {
+            let (lo, hi) = range_of(n, t, tid);
+            let off = offs[tid];
+            let u = &ubuf;
+            let h = &hbuf;
+            s.spawn(move || {
+                let uw = unsafe { &mut *u.0.get() };
+                let hw = unsafe { &mut *h.0.get() };
+                let mut cur = off;
+                for i in lo..hi {
+                    let r = &recs[i];
+                    if i == 0 || r.key != recs[i - 1].key {
+                        uw[cur] = r.key;
+                        cur += 1;
+                    }
+                    unsafe { *hw.get_unchecked_mut(r.refr as usize) = (cur - 1) as u32 };
+                }
+            });
+        }
+    });
+    (ubuf.0.into_inner(), hbuf.0.into_inner())
+}
+
+/// Interned keys (>9 bytes / non-ASCII) are not order-preserving in `Key`.
+/// Re-sort the interned suffix by bytes and merge it into the inline part so
+/// rank order == byte order for every key; remap endpoint ranks accordingly.
+fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
+    const IB: u64 = 1u64 << 63;
+    let n = u.len();
+    if n == 0 || (u[n - 1] & IB) == 0 {
+        return;
+    }
+    let p = u.partition_point(|&k| (k & IB) == 0);
+    // Carry each interned key's ORIGINAL rank (p + position in the u64-sorted
+    // suffix) through the byte sort; the merge must remap that original rank.
+    let mut long: Vec<(Key, usize)> = u[p..]
+        .iter()
+        .enumerate()
+        .map(|(idx, &k)| (Key(k), p + idx))
+        .collect();
+    long.sort_unstable_by(|a, b| a.0.cmp_bytes(&b.0));
+    let mut nu = vec![0u64; n];
+    let mut remap = vec![0u32; n];
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    while i < p && j < long.len() {
+        if Key(u[i]).cmp_bytes(&long[j].0) != std::cmp::Ordering::Greater {
+            nu[k] = u[i];
+            remap[i] = k as u32;
+            i += 1;
+        } else {
+            nu[k] = long[j].0 .0;
+            remap[long[j].1] = k as u32;
+            j += 1;
+        }
+        k += 1;
+    }
+    while i < p {
+        nu[k] = u[i];
+        remap[i] = k as u32;
+        i += 1;
+        k += 1;
+    }
+    while j < long.len() {
+        nu[k] = long[j].0 .0;
+        remap[long[j].1] = k as u32;
+        j += 1;
+        k += 1;
+    }
+    *u = nu;
+    let hn = halves.len();
+    let t = ncpu.min((hn / 16384).max(1));
+    let hbuf = SharedBuf(UnsafeCell::new(std::mem::take(halves)));
+    thread::scope(|s| {
+        for tid in 0..t {
+            let (lo, hi) = range_of(hn, t, tid);
+            let h = &hbuf;
+            let rm = &remap;
+            s.spawn(move || {
+                let hw = unsafe { &mut *h.0.get() };
+                for x in &mut hw[lo..hi] {
+                    *x = rm[*x as usize];
+                }
+            });
+        }
+    });
+    *halves = hbuf.0.into_inner();
+}
+
+/// Find with path halving via monotone CAS: parent values only ever decrease
+/// and parent[x] <= x always holds, so the forest stays acyclic under races.
+#[inline(always)]
+fn cas_find(p: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let px = p[x as usize].load(Ordering::Relaxed);
+        if px == x {
+            return x;
+        }
+        let gx = p[px as usize].load(Ordering::Relaxed);
+        if gx == px {
+            return px;
+        }
+        let _ = p[x as usize].compare_exchange(px, gx, Ordering::Relaxed, Ordering::Relaxed);
+        x = gx;
+    }
+}
+
+/// Concurrent union rounds: hook the larger root onto the smaller (CAS on the
+/// root slot). Roots only decrease, so at convergence each component's root is
+/// its minimum rank == byte-wise smallest ID, independent of thread schedule.
+/// A round that observes different roots but lands no CAS witnessed another
+/// thread's hook this round; hooks are bounded by n-1, so this terminates.
+fn union_rounds(halves: &[u32], parent: &[AtomicU32], ncpu: usize) -> usize {
+    let e = halves.len() / 2;
+    let t = ncpu.min((e / 4096).max(1));
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        let saw_diff: Vec<bool> = thread::scope(|s| {
+            let mut hs = Vec::with_capacity(t);
+            for tid in 0..t {
+                let (lo, hi) = range_of(e, t, tid);
+                let h = halves;
+                let p = parent;
+                hs.push(s.spawn(move || {
+                    let mut diff = false;
+                    for i in lo..hi {
+                        let ra = cas_find(p, h[2 * i]);
+                        let rb = cas_find(p, h[2 * i + 1]);
+                        if ra != rb {
+                            diff = true;
+                            let (big, small) = if ra > rb { (ra, rb) } else { (rb, ra) };
+                            let _ = p[big as usize].compare_exchange(
+                                big,
+                                small,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    diff
+                }));
+            }
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        if !saw_diff.into_iter().any(|d| d) {
+            break;
+        }
+    }
+    rounds
+}
+
+/// Parallel read-only flatten of the converged forest, bucketing non-canonical
+/// entries by hash shard; then build the 8 shard maps in parallel and OR-merge
+/// per-thread bit filters.
+fn build_link_maps(
+    u: &[u64],
+    parent: &[AtomicU32],
+    ncpu: usize,
+    use_bitfilter: bool,
+    mask: usize,
+) -> (Vec<KeyMap<Key>>, Vec<u64>) {
+    let n = u.len();
+    let t = ncpu.min((n / 4096).max(1));
+    let words = if use_bitfilter { (mask + 1) >> 6 } else { 0 };
+    let results: Vec<(Vec<Vec<(u64, u64)>>, Vec<u64>)> = thread::scope(|s| {
+        let mut hs = Vec::with_capacity(t);
+        for tid in 0..t {
+            let (lo, hi) = range_of(n, t, tid);
+            let u = u;
+            let p = parent;
+            hs.push(s.spawn(move || {
+                let mut buckets: Vec<Vec<(u64, u64)>> = (0..8).map(|_| Vec::new()).collect();
+                let mut filt = vec![0u64; words];
+                for r in lo..hi {
+                    let mut root = r as u32;
+                    loop {
+                        let pr = p[root as usize].load(Ordering::Relaxed);
+                        if pr == root {
+                            break;
+                        }
+                        root = pr;
+                    }
+                    if root as usize != r {
+                        let k = u[r];
+                        let v = u[root as usize];
+                        let h = Key(k).hash64();
+                        buckets[(h >> 61) as usize].push((k, v));
+                        if use_bitfilter {
+                            let bit = (h as usize) & mask;
+                            filt[bit >> 6] |= 1u64 << (bit & 63);
+                        }
+                    }
+                }
+                (buckets, filt)
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let maps: Vec<KeyMap<Key>> = thread::scope(|s| {
+        let mut hs = Vec::with_capacity(8);
+        for sh in 0..8usize {
+            let res = &results;
+            hs.push(s.spawn(move || {
+                let cnt: usize = res.iter().map(|(b, _)| b[sh].len()).sum();
+                let mut m = KeyMap::with_capacity(cnt.max(16));
+                for (b, _) in res {
+                    for &(k, v) in &b[sh] {
+                        m.insert_with_hash(Key(k), Key(k).hash64(), Key(v));
+                    }
+                }
+                m
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let non_canonical = if use_bitfilter {
+        let mut out = vec![0u64; words];
+        for (w, o) in out.iter_mut().enumerate() {
+            let mut v = 0u64;
+            for (_, f) in &results {
+                v |= f[w];
+            }
+            *o = v;
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    (maps, non_canonical)
+}
+
+fn load_links_sort(
+    dir: &Path,
+    ncpu: usize,
+    chunk_bytes: usize,
+    use_bitfilter: bool,
+    bitfilter_bits: u32,
+    timing: bool,
+) -> io::Result<LinkTable> {
+    let t_parse = Instant::now();
+    let paths = list_csvs(dir)?;
+    let (files, chunks) = plan_file_chunks(&paths, chunk_bytes)?;
+    if chunks.is_empty() {
+        return Ok(LinkTable::empty());
+    }
+    let next_chunk = AtomicUsize::new(0);
+    let pairs_per_worker: Vec<Vec<(Key, Key)>> = thread::scope(|s| {
+        let mut handles = Vec::with_capacity(ncpu.min(chunks.len()).max(1));
+        for _ in 0..ncpu.min(chunks.len()).max(1) {
+            handles.push(s.spawn(|| {
+                let mut local_pairs = Vec::new();
+                let mut buf = Vec::new();
+                loop {
+                    let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if cidx >= chunks.len() {
+                        break;
+                    }
+                    let ch = &chunks[cidx];
+                    let (start, own_end, scan_len) =
+                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                            .expect("failed to read link chunk");
+                    for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
+                        if !a.is_empty() && !b.is_empty() && a != b {
+                            local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
+                        }
+                    });
+                }
+                local_pairs
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    drop(files);
+    let ms_parse = t_parse.elapsed().as_secs_f64() * 1000.0;
+
+    let e: usize = pairs_per_worker.iter().map(|v| v.len()).sum();
+    if e == 0 {
+        return Ok(LinkTable::empty());
+    }
+
+    // Endpoint records (key, edge*2+side), filled in parallel at disjoint offsets.
+    let t_rec = Instant::now();
+    let mut woff = Vec::with_capacity(pairs_per_worker.len() + 1);
+    let mut acc = 0usize;
+    for pv in &pairs_per_worker {
+        woff.push(acc);
+        acc += pv.len();
+    }
+    woff.push(acc);
+    let zero = EndRec { key: 0, refr: 0 };
+    let recs = SharedBuf(UnsafeCell::new(vec![zero; 2 * e]));
+    let mut scratch = vec![zero; 2 * e];
+    thread::scope(|s| {
+        let mut hs = Vec::with_capacity(pairs_per_worker.len());
+        for (w, pv) in pairs_per_worker.iter().enumerate() {
+            let base = woff[w];
+            let r = &recs;
+            hs.push(s.spawn(move || {
+                let rw = unsafe { &mut *r.0.get() };
+                for (j, &(a, b)) in pv.iter().enumerate() {
+                    let ei = (base + j) as u32;
+                    rw[2 * (base + j)] = EndRec { key: a.0, refr: 2 * ei };
+                    rw[2 * (base + j) + 1] = EndRec { key: b.0, refr: 2 * ei + 1 };
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+    });
+    drop(pairs_per_worker);
+    let mut recs = recs.0.into_inner();
+    let ms_rec = t_rec.elapsed().as_secs_f64() * 1000.0;
+
+    let t_sort = Instant::now();
+    radix_sort_recs(&mut recs, &mut scratch, ncpu);
+    drop(scratch);
+    let ms_sort = t_sort.elapsed().as_secs_f64() * 1000.0;
+
+    let t_rank = Instant::now();
+    let (mut u, mut halves) = rank_recs(&recs, ncpu);
+    drop(recs);
+    fix_interned(&mut u, &mut halves, ncpu);
+    let ms_rank = t_rank.elapsed().as_secs_f64() * 1000.0;
+
+    let t_union = Instant::now();
+    let parent: Vec<AtomicU32> = (0..u.len() as u32).map(AtomicU32::new).collect();
+    let rounds = union_rounds(&halves, &parent, ncpu);
+    drop(halves);
+    let ms_union = t_union.elapsed().as_secs_f64() * 1000.0;
+
+    let t_build = Instant::now();
+    let mask = if use_bitfilter {
+        (1usize << bitfilter_bits) - 1
+    } else {
+        0
+    };
+    let (maps, non_canonical) = build_link_maps(&u, &parent, ncpu, use_bitfilter, mask);
+    let ms_build = t_build.elapsed().as_secs_f64() * 1000.0;
+    if timing {
+        eprintln!(
+            "LINKS_SUB parse={:.1} recs={:.1} sort={:.1} rank={:.1} union={:.1} build={:.1} rounds={} nodes={} edges={}",
+            ms_parse, ms_rec, ms_sort, ms_rank, ms_union, ms_build, rounds, u.len(), e
+        );
+    }
+    Ok(LinkTable {
+        maps,
+        non_canonical,
+        use_bitfilter,
+        mask,
+    })
+}
+
+fn load_links_dispatch(data_dir: &Path, ncpu: usize, cfg: Config) -> io::Result<LinkTable> {
+    let dir = data_dir.join("links");
+    if cfg.links_legacy {
+        load_links_legacy(&dir, ncpu, cfg.chunk_bytes, cfg.use_bitfilter, cfg.bitfilter_bits, cfg.timing)
+    } else {
+        load_links_sort(&dir, ncpu, cfg.chunk_bytes, cfg.use_bitfilter, cfg.bitfilter_bits, cfg.timing)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1137,22 +1673,53 @@ fn main() -> io::Result<()> {
     let organic_idx = campaign_list.len() - 1;
 
     let t0 = Instant::now();
-    let links = load_links(&data_dir.join("links"), ncpu, cfg.chunk_bytes, cfg.use_bitfilter)?;
-    let ms_links = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let t1 = Instant::now();
-    let event_files = list_csvs(&data_dir.join("events"))?;
-    let event_shards = read_events_parallel(
-        &event_files,
-        ncpu,
-        cfg,
-        base_ts,
-        window_start,
-        window_end,
-        &products,
-        unknown_cat_id,
-    )?;
-    let ms_events_io = t1.elapsed().as_secs_f64() * 1000.0;
+    let (links, ms_links, event_shards, ms_events_io) = if cfg.overlap {
+        // Links construction runs beside event parsing; dedup (the first links
+        // consumer) only starts after both join. Output is schedule-independent.
+        let (lres, eres) = thread::scope(|s| {
+            let h = s.spawn(|| {
+                let t = Instant::now();
+                load_links_dispatch(&data_dir, ncpu, cfg)
+                    .map(|l| (l, t.elapsed().as_secs_f64() * 1000.0))
+            });
+            let t1 = Instant::now();
+            let r = (|| -> io::Result<WorkerMatrix<RawEvent>> {
+                let event_files = list_csvs(&data_dir.join("events"))?;
+                read_events_parallel(
+                    &event_files,
+                    ncpu,
+                    cfg,
+                    base_ts,
+                    window_start,
+                    window_end,
+                    &products,
+                    unknown_cat_id,
+                )
+            })();
+            let ms_ev = t1.elapsed().as_secs_f64() * 1000.0;
+            (h.join().unwrap(), r.map(|ev| (ev, ms_ev)))
+        });
+        let (l, ml) = lres?;
+        let (ev, me) = eres?;
+        (l, ml, ev, me)
+    } else {
+        let links = load_links_dispatch(&data_dir, ncpu, cfg)?;
+        let ms_links = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = Instant::now();
+        let event_files = list_csvs(&data_dir.join("events"))?;
+        let event_shards = read_events_parallel(
+            &event_files,
+            ncpu,
+            cfg,
+            base_ts,
+            window_start,
+            window_end,
+            &products,
+            unknown_cat_id,
+        )?;
+        let ms_events_io = t1.elapsed().as_secs_f64() * 1000.0;
+        (links, ms_links, event_shards, ms_events_io)
+    };
 
     // Phase 2: In-place dedup across [0..ew][sh] -> 16-ahead AoS link prefetch -> scatter to 256 person shards
     let t2 = Instant::now();

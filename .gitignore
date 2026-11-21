@@ -3,3 +3,8 @@ dev/
 out/
 fixtures/
 *.zip
+scratch/bin/
+scratch/out/
+scratch/logs/
+scratch/*.log
+scratch/__pycache__/
