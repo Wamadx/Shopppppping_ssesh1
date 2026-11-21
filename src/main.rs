@@ -37,6 +37,7 @@ struct Config {
     use_sortless: bool,
     use_prefetch: bool,
     use_dedup_bitmap: bool,
+    use_wc: bool,
     timing: bool,
     links_legacy: bool,
     overlap: bool,
@@ -68,6 +69,7 @@ impl Config {
             use_sortless: env_bool("SHOP_SORTLESS", false),
             use_prefetch: env_bool("SHOP_PREFETCH", false),
             use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
+            use_wc: env_bool("SHOP_WC", true),
             timing: env_bool("TIMING", false),
             links_legacy: env_bool("SHOP_LINKS_LEGACY", false),
             overlap: env_bool("SHOP_OVERLAP", true),
@@ -1326,6 +1328,82 @@ struct CampaignAgg {
     assisted_sessions: i32,
 }
 
+/// Software write-combining scatter: stages `N` records per shard and appends each full
+/// 64-byte group to the shard Vec with non-temporal stores (no read-for-ownership of the
+/// destination line). `finish` appends partial groups and issues `sfence` so the streamed
+/// data is globally visible before the worker returns to its join.
+struct WcSink<T: Copy + Default, const N: usize> {
+    stage: Vec<[T; N]>,
+    cnt: Vec<u8>,
+    on: bool,
+}
+
+impl<T: Copy + Default, const N: usize> WcSink<T, N> {
+    fn new(shards: usize, on: bool) -> Self {
+        Self { stage: vec![[T::default(); N]; shards], cnt: vec![0; shards], on }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, sh: usize, v: T, out: &mut [Vec<T>]) {
+        if !self.on {
+            unsafe { out.get_unchecked_mut(sh) }.push(v);
+            return;
+        }
+        let c = unsafe { *self.cnt.get_unchecked(sh) } as usize;
+        unsafe { *self.stage.get_unchecked_mut(sh).get_unchecked_mut(c) = v };
+        if c + 1 == N {
+            Self::flush_full(unsafe { self.stage.get_unchecked(sh) }, unsafe { out.get_unchecked_mut(sh) });
+            unsafe { *self.cnt.get_unchecked_mut(sh) = 0 };
+        } else {
+            unsafe { *self.cnt.get_unchecked_mut(sh) = (c + 1) as u8 };
+        }
+    }
+
+    #[inline(always)]
+    fn flush_full(src: &[T; N], dst: &mut Vec<T>) {
+        dst.reserve(N);
+        let len = dst.len();
+        let bytes = N * std::mem::size_of::<T>();
+        let p = unsafe { dst.as_mut_ptr().add(len) } as *mut u8;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+        {
+            if bytes == 64 && (p as usize) & 63 == 0 {
+                use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_stream_si256};
+                let s = src.as_ptr() as *const u8;
+                unsafe {
+                    let a = _mm256_loadu_si256(s as *const __m256i);
+                    let b = _mm256_loadu_si256(s.add(32) as *const __m256i);
+                    _mm256_stream_si256(p as *mut __m256i, a);
+                    _mm256_stream_si256(p.add(32) as *mut __m256i, b);
+                    dst.set_len(len + N);
+                }
+                return;
+            }
+        }
+        let _ = (bytes, p);
+        dst.extend_from_slice(src);
+    }
+
+    fn finish(&mut self, out: &mut [Vec<T>]) {
+        if !self.on {
+            return;
+        }
+        for (sh, c) in self.cnt.iter_mut().enumerate() {
+            if *c > 0 {
+                out[sh].extend_from_slice(&self.stage[sh][..*c as usize]);
+                *c = 0;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<RawEvent>() * 2 == 64);
+const _: () = assert!(std::mem::size_of::<PersonEvent>() * 4 == 64);
+
 fn read_events_parallel(
     paths: &[PathBuf],
     ncpu: usize,
@@ -1350,6 +1428,7 @@ fn read_events_parallel(
                 let mut out: Vec<Vec<RawEvent>> = (0..NUM_DEDUP_SHARDS)
                     .map(|_| Vec::with_capacity(per_shard_cap))
                     .collect();
+                let mut wc: WcSink<RawEvent, 2> = WcSink::new(NUM_DEDUP_SHARDS, cfg.use_wc);
                 let mut dc_ing = DateCache::new();
                 let mut dc_ts = DateCache::new();
                 let mut buf = Vec::new();
@@ -1416,16 +1495,21 @@ fn read_events_parallel(
                                 Key::EMPTY
                             };
                             let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
-                            out[shard].push(RawEvent {
-                                event_id,
-                                user_id,
-                                ingest_ts,
-                                ts_rel,
-                                price_cat,
-                            });
+                            wc.push(
+                                shard,
+                                RawEvent {
+                                    event_id,
+                                    user_id,
+                                    ingest_ts,
+                                    ts_rel,
+                                    price_cat,
+                                },
+                                &mut out,
+                            );
                         },
                     );
                 }
+                wc.finish(&mut out);
                 out
             }));
         }
@@ -1746,6 +1830,7 @@ fn main() -> io::Result<()> {
                         .map(|_| Vec::with_capacity(per_person_shard_cap))
                         .collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
+                    let mut pwc: WcSink<PersonEvent, 4> = WcSink::new(NUM_PERSON_SHARDS, cfg.use_wc);
                     let mut seen_bm: Vec<u64> = Vec::new();
                     let mut dup_bm: Vec<u64> = Vec::new();
 
@@ -1808,7 +1893,7 @@ fn main() -> io::Result<()> {
                                             let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
                                             let packed_ev =
                                                 ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
-                                            out[psh].push(PersonEvent { person_id, packed_ev });
+                                            pwc.push(psh, PersonEvent { person_id, packed_ev }, &mut out);
                                         }
                                         continue;
                                     }
@@ -1836,13 +1921,11 @@ fn main() -> io::Result<()> {
                                 let psh = (person_id.hash64() >> PERSON_SHIFT) as usize;
                                 let packed_ev =
                                     ((ev.ts_rel as u64) << 32) | (ev.price_cat as u64);
-                                out[psh].push(PersonEvent {
-                                    person_id,
-                                    packed_ev,
-                                });
+                                pwc.push(psh, PersonEvent { person_id, packed_ev }, &mut out);
                             }
                         }
                     }
+                    pwc.finish(&mut out);
                     out
                 }));
             }

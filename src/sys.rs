@@ -72,7 +72,8 @@ mod linux_sys {
 
     #[inline]
     unsafe fn alloc_medium(size: usize, align: usize) -> *mut u8 {
-        let align = align.max(16);
+        // 64 B so Vec storage is cache-line aligned for write-combining streaming stores.
+        let align = align.max(64);
         while SLAB_LOCK
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
