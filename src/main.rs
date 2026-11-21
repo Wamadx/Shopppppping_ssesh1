@@ -2511,12 +2511,20 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        // The prefix sums allocate one disjoint output range per person; every event
+                        // writes once within its person's range, covering exactly 0..total_evs.
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        let sorted_evs_ptr = sorted_evs.as_mut_ptr();
                         for &(lpid, packed_ev) in &bin_buf[..total_evs] {
                             let dst = ev_counts[lpid as usize] as usize;
                             ev_counts[lpid as usize] = (dst + 1) as u32;
-                            sorted_evs[dst] = packed_ev;
+                            unsafe { sorted_evs_ptr.add(dst).write(packed_ev) };
                         }
+                        debug_assert!(
+                            (0..num_people).all(|p| ev_counts[p] == ev_offs[p + 1])
+                        );
+                        unsafe { sorted_evs.set_len(total_evs) };
                     } else {
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2548,7 +2556,11 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        // As above, the per-person ranges tile the whole output and the second
+                        // scan writes each event exactly once before publishing its length.
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        let sorted_evs_ptr = sorted_evs.as_mut_ptr();
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2557,10 +2569,15 @@ fn main() -> io::Result<()> {
                                 k += 1;
                                 let dst = ev_counts[lpid] as usize;
                                 ev_counts[lpid] = (dst + 1) as u32;
-                                sorted_evs[dst] = ev.packed_ev;
+                                unsafe { sorted_evs_ptr.add(dst).write(ev.packed_ev) };
                             }
                             *evs = Vec::new();
                         }
+                        debug_assert_eq!(k, total_evs);
+                        debug_assert!(
+                            (0..num_people).all(|p| ev_counts[p] == ev_offs[p + 1])
+                        );
+                        unsafe { sorted_evs.set_len(total_evs) };
                     }
 
                     let num_people = p_ids.len();
@@ -2601,19 +2618,22 @@ fn main() -> io::Result<()> {
                     }
                     clk_offs[num_people] = cacc;
 
-                    sorted_clks.resize(
-                        clk_tmp.len(),
-                        CompactClick {
-                            ts_rel: 0,
-                            campaign_idx: 0,
-                            click_id: Key::EMPTY,
-                        },
-                    );
+                    // clk_tmp contains exactly one record per counted click, so these writes
+                    // fill every slot in the tiled per-person ranges before set_len.
+                    let total_clks = clk_tmp.len();
+                    debug_assert_eq!(cacc as usize, total_clks);
+                    sorted_clks.clear();
+                    sorted_clks.reserve(total_clks);
+                    let sorted_clks_ptr = sorted_clks.as_mut_ptr();
                     for &(lpid, cc) in &clk_tmp {
                         let dst = clk_counts[lpid as usize] as usize;
                         clk_counts[lpid as usize] = (dst + 1) as u32;
-                        sorted_clks[dst] = cc;
+                        unsafe { sorted_clks_ptr.add(dst).write(cc) };
                     }
+                    debug_assert!(
+                        (0..num_people).all(|p| clk_counts[p] == clk_offs[p + 1])
+                    );
+                    unsafe { sorted_clks.set_len(total_clks) };
 
                     for p in 0..num_people {
                         let pid = p_ids[p];
