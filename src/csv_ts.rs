@@ -515,6 +515,21 @@ impl Key {
     }
 
     #[inline]
+    pub fn prefix_bytes(self, out: &mut [u8; 8]) -> usize {
+        if (self.0 & INTERNED_BIT) == 0 {
+            let mut buf = [0u8; 9];
+            let len = self.unpack_inline(&mut buf).min(8);
+            out[..len].copy_from_slice(&buf[..len]);
+            len
+        } else {
+            let s = self.long_bytes();
+            let len = s.len().min(8);
+            out[..len].copy_from_slice(&s[..len]);
+            len
+        }
+    }
+
+    #[inline]
     pub fn write_parquet_bytes(self, out: &mut Vec<u8>) {
         if (self.0 & INTERNED_BIT) == 0 {
             let mut buf = [0u8; 9];

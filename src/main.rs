@@ -961,6 +961,61 @@ fn rank_recs(recs: &[EndRec], ncpu: usize) -> (Vec<u64>, Vec<u32>) {
     (ubuf.0.into_inner(), hbuf.0.into_inner())
 }
 
+#[derive(Clone, Copy)]
+struct LongOrderRec {
+    prefix: u64,
+    key: Key,
+    original: u32,
+}
+
+impl LongOrderRec {
+    fn new(key: Key, original: usize) -> Self {
+        let mut bytes = [0u8; 8];
+        key.prefix_bytes(&mut bytes);
+        Self { prefix: u64::from_be_bytes(bytes), key, original: original as u32 }
+    }
+}
+
+/// LSD radix order on the first eight bytes; short equal-prefix groups are the
+/// only ones that need full byte comparisons.
+fn radix_sort_long_order(recs: &mut Vec<LongOrderRec>) {
+    let n = recs.len();
+    let mut scratch = vec![
+        LongOrderRec { prefix: 0, key: Key::EMPTY, original: 0 };
+        n
+    ];
+    for pass in 0..8u32 {
+        let shift = pass * 8;
+        let mut hist = [0usize; 256];
+        for r in recs.iter() {
+            hist[((r.prefix >> shift) & 255) as usize] += 1;
+        }
+        let mut next = 0usize;
+        for h in &mut hist {
+            let count = *h;
+            *h = next;
+            next += count;
+        }
+        for r in recs.iter() {
+            let b = ((r.prefix >> shift) & 255) as usize;
+            scratch[hist[b]] = *r;
+            hist[b] += 1;
+        }
+        std::mem::swap(recs, &mut scratch);
+    }
+    let mut start = 0usize;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && recs[end].prefix == recs[start].prefix {
+            end += 1;
+        }
+        if end - start > 1 {
+            recs[start..end].sort_unstable_by(|a, b| a.key.cmp_bytes(&b.key));
+        }
+        start = end;
+    }
+}
+
 /// Interned keys (>9 bytes / non-ASCII) are not order-preserving in `Key`.
 /// Re-sort the interned suffix by bytes and merge it into the inline part so
 /// rank order == byte order for every key; remap endpoint ranks accordingly.
@@ -973,23 +1028,23 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     let p = u.partition_point(|&k| (k & IB) == 0);
     // Carry each interned key's ORIGINAL rank (p + position in the u64-sorted
     // suffix) through the byte sort; the merge must remap that original rank.
-    let mut long: Vec<(Key, usize)> = u[p..]
+    let mut long: Vec<LongOrderRec> = u[p..]
         .iter()
         .enumerate()
-        .map(|(idx, &k)| (Key(k), p + idx))
+        .map(|(idx, &k)| LongOrderRec::new(Key(k), p + idx))
         .collect();
-    long.sort_unstable_by(|a, b| a.0.cmp_bytes(&b.0));
+    radix_sort_long_order(&mut long);
     let mut nu = vec![0u64; n];
     let mut remap = vec![0u32; n];
     let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
     while i < p && j < long.len() {
-        if Key(u[i]).cmp_bytes(&long[j].0) != std::cmp::Ordering::Greater {
+        if Key(u[i]).cmp_bytes(&long[j].key) != std::cmp::Ordering::Greater {
             nu[k] = u[i];
             remap[i] = k as u32;
             i += 1;
         } else {
-            nu[k] = long[j].0 .0;
-            remap[long[j].1] = k as u32;
+            nu[k] = long[j].key .0;
+            remap[long[j].original as usize] = k as u32;
             j += 1;
         }
         k += 1;
@@ -1001,8 +1056,8 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
         k += 1;
     }
     while j < long.len() {
-        nu[k] = long[j].0 .0;
-        remap[long[j].1] = k as u32;
+        nu[k] = long[j].key .0;
+        remap[long[j].original as usize] = k as u32;
         j += 1;
         k += 1;
     }
