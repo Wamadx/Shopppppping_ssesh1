@@ -1016,6 +1016,15 @@ fn radix_sort_long_order(recs: &mut Vec<LongOrderRec>) {
         for r in recs.iter() {
             hist[((r.prefix >> shift) & 255) as usize] += 1;
         }
+        let mut nz = 0usize;
+        for &c in &hist {
+            if c > 0 {
+                nz += 1;
+            }
+        }
+        if nz <= 1 {
+            continue;
+        }
         let mut next = 0usize;
         for h in &mut hist {
             let count = *h;
@@ -1042,6 +1051,22 @@ fn radix_sort_long_order(recs: &mut Vec<LongOrderRec>) {
     }
 }
 
+#[inline(always)]
+fn inline_prefix_be(k: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        core::arch::x86_64::_pdep_u64(k >> 7, 0x7F7F_7F7F_7F7F_7F7F)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut buf = [0u8; 9];
+        Key(k).unpack_inline(&mut buf);
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&buf[..8]);
+        u64::from_be_bytes(out)
+    }
+}
+
 /// Interned keys (>9 bytes / non-ASCII) are not order-preserving in `Key`.
 /// Re-sort the interned suffix by bytes and merge it into the inline part so
 /// rank order == byte order for every key; remap endpoint ranks accordingly.
@@ -1064,7 +1089,14 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     let mut remap = vec![0u32; n];
     let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
     while i < p && j < long.len() {
-        if Key(u[i]).cmp_bytes(&long[j].key) != std::cmp::Ordering::Greater {
+        let up = inline_prefix_be(u[i]);
+        let lp = long[j].prefix;
+        let le = if up != lp {
+            up < lp
+        } else {
+            Key(u[i]).cmp_bytes(&long[j].key) != std::cmp::Ordering::Greater
+        };
+        if le {
             nu[k] = u[i];
             remap[i] = k as u32;
             i += 1;
@@ -1649,6 +1681,7 @@ fn read_clicks_parallel(
                 let mut dc = DateCache::new();
                 let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                 let mut buf = Vec::new();
+                let mut chunk_clks: Vec<(Key, Key, u32, u32)> = Vec::with_capacity(8192);
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     if cidx >= chunks.len() {
@@ -1658,6 +1691,7 @@ fn read_clicks_parallel(
                     let (start, own_end, scan_len) =
                         load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read click chunk");
+                    chunk_clks.clear();
                     for_each_record_simd::<4>(
                         &buf,
                         start,
@@ -1677,17 +1711,31 @@ fn read_clicks_parallel(
                                 return;
                             }
                             let raw_uid = Key::from_bytes(uid);
-                            let person_id = links.resolve(raw_uid, &mut link_cache);
                             let click_id = Key::from_bytes_unordered(clid);
-                            let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
-                            out[shard].push(PersonClick {
-                                person_id,
+                            chunk_clks.push((
+                                raw_uid,
                                 click_id,
-                                ts_rel: (ts - base_ts) as u32,
-                                campaign_idx: campaign_idx as u32,
-                            });
+                                (ts - base_ts) as u32,
+                                campaign_idx as u32,
+                            ));
                         },
                     );
+                    let n = chunk_clks.len();
+                    for i in 0..n {
+                        if i + 16 < n {
+                            links.prefetch(unsafe { chunk_clks.get_unchecked(i + 16) }.0);
+                        }
+                        let (raw_uid, click_id, ts_rel, campaign_idx) =
+                            unsafe { *chunk_clks.get_unchecked(i) };
+                        let person_id = links.resolve(raw_uid, &mut link_cache);
+                        let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
+                        out[shard].push(PersonClick {
+                            person_id,
+                            click_id,
+                            ts_rel,
+                            campaign_idx,
+                        });
+                    }
                 }
                 out
             }));

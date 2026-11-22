@@ -632,6 +632,8 @@ pub struct UserDailyWriter<'a> {
     total_rows: i64,
     row_groups: Vec<RowGroupMeta<'static>>,
     rg_rows: usize,
+    last_user_id: Key,
+    last_user_wire: Vec<u8>,
     user_id_buf: Vec<u8>,
     day_buf: Vec<u8>,
     sessions_buf: Vec<u8>,
@@ -654,6 +656,8 @@ impl<'a> UserDailyWriter<'a> {
             total_rows: 0,
             row_groups: Vec::new(),
             rg_rows: 0,
+            last_user_id: Key::EMPTY,
+            last_user_wire: Vec::with_capacity(64),
             user_id_buf: Vec::with_capacity(1 << 20),
             day_buf: Vec::with_capacity(1 << 18),
             sessions_buf: Vec::with_capacity(1 << 18),
@@ -691,7 +695,12 @@ impl<'a> UserDailyWriter<'a> {
         top_category: u16,
         categories: &[Box<[u8]>],
     ) {
-        user_id.write_parquet_bytes(&mut self.user_id_buf);
+        if user_id != self.last_user_id {
+            self.last_user_id = user_id;
+            self.last_user_wire.clear();
+            user_id.write_parquet_bytes(&mut self.last_user_wire);
+        }
+        self.user_id_buf.extend_from_slice(&self.last_user_wire);
         self.day_buf.extend_from_slice(&day.to_le_bytes());
         self.sessions_buf.extend_from_slice(&sessions.to_le_bytes());
         self.events_buf.extend_from_slice(&events.to_le_bytes());

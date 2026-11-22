@@ -1,10 +1,11 @@
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const INTERNED_BIT: u64 = 1u64 << 63;
-const INTERNED_LEN_SHIFT: u32 = 48;
-const INTERNED_LEN_MASK: u64 = 0x7fff;
+const INTERNED_TAG_SHIFT: u32 = 55;
+const INTERNED_LEN_SHIFT: u32 = 47;
+const INTERNED_LEN_MASK: u64 = 0xFF;
 const INTERNED_PTR_MASK: u64 = (1u64 << 47) - 1;
 const NUM_INTERN_SHARDS: usize = 256;
 const INTERN_ARENA_CHUNK: usize = 256 * 1024;
@@ -198,7 +199,7 @@ impl Interner {
 
     fn intern(&mut self, s: &[u8], hash: u64, sh: usize) -> Key {
         if let Some(idx) = self.lookup(s, hash) {
-            return Key::encode_interned(sh, idx, self.slices[idx as usize]);
+            return Key::encode_interned(sh, idx, self.slices[idx as usize], hash);
         }
         if self.slots.is_empty() || (self.slices.len() + 1) * 2 > self.slots.len() {
             self.grow();
@@ -215,7 +216,7 @@ impl Interner {
             hash,
             idx_plus_one: idx + 1,
         };
-        Key::encode_interned(sh, idx, stored)
+        Key::encode_interned(sh, idx, stored, hash)
     }
 }
 
@@ -230,24 +231,14 @@ fn interners() -> &'static [Mutex<Interner>; NUM_INTERN_SHARDS] {
 const FAST_INTERN_SLOTS: usize = 1 << 13;
 const FAST_INTERN_LIMIT: usize = FAST_INTERN_SLOTS * 3 / 4;
 
-#[derive(Clone, Copy, Default)]
-struct FastEntry {
-    hash: u64,
-    ptr: usize,
-    len: usize,
-}
-
 #[repr(align(64))]
 struct FastInterner {
     slots: Vec<AtomicU64>,
-    entries: Box<[UnsafeCell<std::mem::MaybeUninit<FastEntry>>]>,
     next: AtomicUsize,
     active: AtomicUsize,
     closed: AtomicBool,
 }
 
-// Each entry index has one writer. Its contents are fully initialized before a
-// release CAS publishes the corresponding slot; readers acquire that slot.
 unsafe impl Sync for FastInterner {}
 
 impl FastInterner {
@@ -256,14 +247,8 @@ impl FastInterner {
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut AtomicU64 };
         assert!(!ptr.is_null());
         let slots = unsafe { Vec::from_raw_parts(ptr, FAST_INTERN_SLOTS, FAST_INTERN_SLOTS) };
-        let mut entries_v: Vec<UnsafeCell<std::mem::MaybeUninit<FastEntry>>> =
-            Vec::with_capacity(FAST_INTERN_LIMIT);
-        unsafe {
-            entries_v.set_len(FAST_INTERN_LIMIT);
-        }
         Self {
             slots,
-            entries: entries_v.into_boxed_slice(),
             next: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -271,35 +256,27 @@ impl FastInterner {
     }
 
     #[inline(always)]
-    fn tag(hash: u64) -> u64 {
-        hash >> 32
-    }
-
-    #[inline(always)]
-    unsafe fn entry_ref(&self, idx: usize) -> &FastEntry {
-        unsafe { (&*self.entries[idx].get()).assume_init_ref() }
-    }
-
-    #[inline(always)]
-    fn entry_bytes(&self, idx: usize) -> &'static [u8] {
-        let e = unsafe { self.entry_ref(idx) };
-        unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) }
-    }
-
-    fn lookup(&self, s: &[u8], hash: u64, sh: usize) -> Option<Key> {
+    fn lookup(&self, s: &[u8], hash: u64) -> Option<Key> {
+        let len = s.len();
+        if len == 0 || len > INTERNED_LEN_MASK as usize {
+            return None;
+        }
         let mask = self.slots.len() - 1;
         let mut pos = (hash as usize) & mask;
-        let tag = Self::tag(hash);
+        let tag_len = (((hash >> 48) & 0xFF) << INTERNED_TAG_SHIFT)
+            | ((len as u64) << INTERNED_LEN_SHIFT);
+        let tag_len_mask =
+            (0xFFu64 << INTERNED_TAG_SHIFT) | (INTERNED_LEN_MASK << INTERNED_LEN_SHIFT);
         loop {
-            let v = self.slots[pos].load(Ordering::Acquire);
+            let v = unsafe { self.slots.get_unchecked(pos) }.load(Ordering::Acquire);
             if v == 0 {
                 return None;
             }
-            if (v >> 32) == tag {
-                let idx = (v as u32 - 1) as usize;
-                let e = unsafe { self.entry_ref(idx) };
-                if e.hash == hash && self.entry_bytes(idx) == s {
-                    return Some(Key::encode_interned(sh, idx as u32, self.entry_bytes(idx)));
+            if (v & tag_len_mask) == tag_len {
+                let ptr = (v & INTERNED_PTR_MASK) as *const u8;
+                let stored = unsafe { std::slice::from_raw_parts(ptr, len) };
+                if stored == s {
+                    return Some(Key(v));
                 }
             }
             pos = (pos + 1) & mask;
@@ -309,8 +286,9 @@ impl FastInterner {
     // None means that this shard closed at its load limit. The caller drains
     // active inserts before crossing to the legacy table so the two tables can
     // never return different canonical keys for the same bytes.
-    fn intern(&self, s: &[u8], hash: u64, sh: usize) -> Option<Key> {
-        if self.closed.load(Ordering::Acquire) {
+    fn intern(&self, s: &[u8], hash: u64) -> Option<Key> {
+        let len = s.len();
+        if len == 0 || len > INTERNED_LEN_MASK as usize || self.closed.load(Ordering::Acquire) {
             return None;
         }
         self.active.fetch_add(1, Ordering::Acquire);
@@ -326,30 +304,31 @@ impl FastInterner {
         }
 
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
-        unsafe {
-            (*self.entries[idx].get()).write(FastEntry {
-                hash,
-                ptr: stored.as_ptr() as usize,
-                len: stored.len(),
-            });
-        }
-        let wanted = (Self::tag(hash) << 32) | (idx as u64 + 1);
+        let Some(wanted_key) = Key::encode_direct(stored, hash) else {
+            self.closed.store(true, Ordering::Release);
+            self.active.fetch_sub(1, Ordering::Release);
+            return None;
+        };
+        let wanted = wanted_key.0;
+        let tag_len_mask =
+            (0xFFu64 << INTERNED_TAG_SHIFT) | (INTERNED_LEN_MASK << INTERNED_LEN_SHIFT);
+        let tag_len = wanted & tag_len_mask;
         let mask = self.slots.len() - 1;
         let mut pos = (hash as usize) & mask;
         let key = loop {
-            let slot = &self.slots[pos];
+            let slot = unsafe { self.slots.get_unchecked(pos) };
             let mut v = slot.load(Ordering::Acquire);
             if v == 0 {
                 match slot.compare_exchange_weak(0, wanted, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => break Key::encode_interned(sh, idx as u32, stored),
+                    Ok(_) => break wanted_key,
                     Err(actual) => v = actual,
                 }
             }
-            if (v >> 32) == Self::tag(hash) {
-                let other = (v as u32 - 1) as usize;
-                let e = unsafe { self.entry_ref(other) };
-                if e.hash == hash && self.entry_bytes(other) == s {
-                    break Key::encode_interned(sh, other as u32, self.entry_bytes(other));
+            if (v & tag_len_mask) == tag_len {
+                let ptr = (v & INTERNED_PTR_MASK) as *const u8;
+                let other = unsafe { std::slice::from_raw_parts(ptr, len) };
+                if other == s {
+                    break Key(v);
                 }
             }
             pos = (pos + 1) & mask;
@@ -362,7 +341,7 @@ impl FastInterner {
         while self.active.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
         }
-        self.lookup(s, hash, sh)
+        self.lookup(s, hash)
             .unwrap_or_else(|| interners()[sh].lock().unwrap().intern(s, hash, sh))
     }
 }
@@ -459,10 +438,8 @@ impl Key {
             return Self::intern_slow(s, hash_bytes(s));
         }
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
-        let ptr = stored.as_ptr() as usize as u64;
-        let len = stored.len() as u64;
-        if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
-            Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
+        if let Some(k) = Self::encode_direct(stored, 0) {
+            k
         } else {
             Self::intern_slow(s, hash_bytes(s))
         }
@@ -511,12 +488,24 @@ impl Key {
         Some(Self(acc))
     }
 
-    #[inline]
-    fn encode_interned(sh: usize, idx: u32, s: &'static [u8]) -> Self {
+    #[inline(always)]
+    fn encode_direct(s: &'static [u8], hash: u64) -> Option<Self> {
         let ptr = s.as_ptr() as usize as u64;
         let len = s.len() as u64;
         if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
-            Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
+            let tag8 = (hash >> 48) & 0xFF;
+            Some(Self(
+                INTERNED_BIT | (tag8 << INTERNED_TAG_SHIFT) | (len << INTERNED_LEN_SHIFT) | ptr,
+            ))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn encode_interned(sh: usize, idx: u32, s: &'static [u8], hash: u64) -> Self {
+        if let Some(k) = Self::encode_direct(s, hash) {
+            k
         } else {
             Self(INTERNED_BIT | ((sh as u64) << 32) | (idx as u64))
         }
@@ -539,10 +528,10 @@ impl Key {
 
         let sh = ((hash >> 56) as usize) & (NUM_INTERN_SHARDS - 1);
         let fast = &fast_interners()[sh];
-        let key = if let Some(key) = fast.lookup(s, hash, sh) {
+        let key = if let Some(key) = fast.lookup(s, hash) {
             key
         } else {
-            fast.intern(s, hash, sh)
+            fast.intern(s, hash)
                 .unwrap_or_else(|| fast.fallback(s, hash, sh))
         };
         INTERN_CACHE.with(|cache| {
@@ -551,20 +540,40 @@ impl Key {
         key
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn unpack_inline(self, buf: &mut [u8; 9]) -> usize {
-        let mut v = self.0;
-        let mut len = 0usize;
-        while len < 9 {
-            let b = ((v >> 56) & 0x7f) as u8;
-            if b == 0 {
-                break;
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            if self.0 == 0 {
+                return 0;
             }
-            buf[len] = b;
-            len += 1;
-            v <<= 7;
+            let be = unsafe {
+                core::arch::x86_64::_pdep_u64(self.0 >> 7, 0x7F7F_7F7F_7F7F_7F7F)
+            };
+            buf[..8].copy_from_slice(&be.to_be_bytes());
+            let b8 = (self.0 & 0x7F) as u8;
+            buf[8] = b8;
+            if b8 != 0 {
+                9
+            } else {
+                8 - (be.trailing_zeros() >> 3) as usize
+            }
         }
-        len
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let mut v = self.0;
+            let mut len = 0usize;
+            while len < 9 {
+                let b = ((v >> 56) & 0x7f) as u8;
+                if b == 0 {
+                    break;
+                }
+                buf[len] = b;
+                len += 1;
+                v <<= 7;
+            }
+            len
+        }
     }
 
     #[inline(always)]
@@ -785,105 +794,175 @@ unsafe fn for_each_record_avx2<const N: usize>(
     let mut q_cnt = 0u32;
     let mut fields = [&[][..]; N];
 
-    let mut blk = start;
-    while blk < scan_len {
-        let p = unsafe { ptr.add(blk) };
-        unsafe {
-            _mm_prefetch(p.add(256) as *const i8, _MM_HINT_T0);
-        }
-        let v0 = unsafe { _mm256_loadu_si256(p as *const __m256i) };
-        let v1 = unsafe { _mm256_loadu_si256(p.add(32) as *const __m256i) };
+        let mut blk = start;
+        while blk < scan_len {
+            let p = unsafe { ptr.add(blk) };
+            unsafe {
+                _mm_prefetch(p.add(256) as *const i8, _MM_HINT_T0);
+            }
+            let v0 = unsafe { _mm256_loadu_si256(p as *const __m256i) };
+            let v1 = unsafe { _mm256_loadu_si256(p.add(32) as *const __m256i) };
 
-        let mut nl = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_v)) as u32) as u64)
-            | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_v)) as u32) as u64) << 32);
-        let mut cm = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, cm_v)) as u32) as u64)
-            | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, cm_v)) as u32) as u64) << 32);
-        let mut qt = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, qt_v)) as u32) as u64)
-            | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, qt_v)) as u32) as u64) << 32);
+            let mut nl = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_v)) as u32) as u64)
+                | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_v)) as u32) as u64) << 32);
+            let mut cm = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, cm_v)) as u32) as u64)
+                | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, cm_v)) as u32) as u64) << 32);
+            let mut qt = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, qt_v)) as u32) as u64)
+                | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, qt_v)) as u32) as u64) << 32);
 
-        if blk + 64 > scan_len {
-            let rem = scan_len - blk;
-            let keep = (1u64 << rem) - 1;
-            nl &= keep;
-            cm &= keep;
-            qt &= keep;
-        }
+            if blk + 64 > scan_len {
+                let rem = scan_len - blk;
+                let keep = (1u64 << rem) - 1;
+                nl &= keep;
+                cm &= keep;
+                qt &= keep;
+            }
 
-        while nl != 0 {
-            let nl_bit = nl.trailing_zeros();
-            let nl_off = blk + nl_bit as usize;
-            let before_nl = (1u64 << nl_bit) - 1;
-            let mut line_cm = cm & before_nl;
-            let line_qt = qt & before_nl;
-            let line_commas = line_cm.count_ones() as usize;
+            if nl == 0 && fidx == 0 && !too_many && q_cnt == 0 && blk + 64 < scan_len {
+                let blk1 = blk + 64;
+                let p1 = unsafe { ptr.add(blk1) };
+                let v2 = unsafe { _mm256_loadu_si256(p1 as *const __m256i) };
+                let v3 = unsafe { _mm256_loadu_si256(p1.add(32) as *const __m256i) };
 
-            if fidx == 0 && !too_many && line_commas == N - 1 {
-                let total_q = q_cnt + line_qt.count_ones();
-                for j in 0..(N - 1) {
-                    let cb_bit = line_cm.trailing_zeros();
-                    let coff = blk + cb_bit as usize;
-                    f_starts[j] = cur_fstart;
-                    f_ends[j] = coff;
-                    cur_fstart = coff + 1;
-                    line_cm &= line_cm - 1;
+                let mut nl1 = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, nl_v)) as u32) as u64)
+                    | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, nl_v)) as u32) as u64) << 32);
+                let mut cm1 = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, cm_v)) as u32) as u64)
+                    | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, cm_v)) as u32) as u64) << 32);
+                let mut qt1 = ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, qt_v)) as u32) as u64)
+                    | (((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, qt_v)) as u32) as u64) << 32);
+
+                if blk1 + 64 > scan_len {
+                    let rem = scan_len - blk1;
+                    let keep = (1u64 << rem) - 1;
+                    nl1 &= keep;
+                    cm1 &= keep;
+                    qt1 &= keep;
                 }
-                f_starts[N - 1] = cur_fstart;
-                f_ends[N - 1] = nl_off;
-                if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
-                    cb(fields);
+
+                if nl1 != 0 {
+                    let nl_bit = nl1.trailing_zeros();
+                    let nl_off = blk1 + nl_bit as usize;
+                    let before_nl1 = (1u64 << nl_bit) - 1;
+                    let mut line_cm0 = cm;
+                    let mut line_cm1 = cm1 & before_nl1;
+                    let line_qt1 = qt1 & before_nl1;
+                    if (line_cm0.count_ones() + line_cm1.count_ones()) as usize == N - 1 {
+                        let total_q = qt.count_ones() + line_qt1.count_ones();
+                        let mut j = 0usize;
+                        while line_cm0 != 0 {
+                            let cb_bit = line_cm0.trailing_zeros();
+                            let coff = blk + cb_bit as usize;
+                            f_starts[j] = cur_fstart;
+                            f_ends[j] = coff;
+                            j += 1;
+                            cur_fstart = coff + 1;
+                            line_cm0 &= line_cm0 - 1;
+                        }
+                        while line_cm1 != 0 {
+                            let cb_bit = line_cm1.trailing_zeros();
+                            let coff = blk1 + cb_bit as usize;
+                            f_starts[j] = cur_fstart;
+                            f_ends[j] = coff;
+                            j += 1;
+                            cur_fstart = coff + 1;
+                            line_cm1 &= line_cm1 - 1;
+                        }
+                        f_starts[N - 1] = cur_fstart;
+                        f_ends[N - 1] = nl_off;
+                        if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                            cb(fields);
+                        }
+                    }
+                    let next_line = nl_off + 1;
+                    if next_line >= own_end {
+                        return;
+                    }
+                    cur_fstart = next_line;
+                    blk = next_line;
+                    continue;
                 }
-            } else if !too_many && fidx + line_commas == N - 1 {
-                let total_q = q_cnt + line_qt.count_ones();
-                while line_cm != 0 {
-                    let cb_bit = line_cm.trailing_zeros();
-                    let coff = blk + cb_bit as usize;
+            }
+
+            let had_nl = nl != 0;
+            while nl != 0 {
+                let nl_bit = nl.trailing_zeros();
+                let nl_off = blk + nl_bit as usize;
+                let before_nl = (1u64 << nl_bit) - 1;
+                let mut line_cm = cm & before_nl;
+                let line_qt = qt & before_nl;
+                let line_commas = line_cm.count_ones() as usize;
+
+                if fidx == 0 && !too_many && line_commas == N - 1 {
+                    let total_q = q_cnt + line_qt.count_ones();
+                    for j in 0..(N - 1) {
+                        let cb_bit = line_cm.trailing_zeros();
+                        let coff = blk + cb_bit as usize;
+                        f_starts[j] = cur_fstart;
+                        f_ends[j] = coff;
+                        cur_fstart = coff + 1;
+                        line_cm &= line_cm - 1;
+                    }
+                    f_starts[N - 1] = cur_fstart;
+                    f_ends[N - 1] = nl_off;
+                    if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                        cb(fields);
+                    }
+                } else if !too_many && fidx + line_commas == N - 1 {
+                    let total_q = q_cnt + line_qt.count_ones();
+                    while line_cm != 0 {
+                        let cb_bit = line_cm.trailing_zeros();
+                        let coff = blk + cb_bit as usize;
+                        f_starts[fidx] = cur_fstart;
+                        f_ends[fidx] = coff;
+                        fidx += 1;
+                        cur_fstart = coff + 1;
+                        line_cm &= line_cm - 1;
+                    }
                     f_starts[fidx] = cur_fstart;
-                    f_ends[fidx] = coff;
-                    fidx += 1;
-                    cur_fstart = coff + 1;
-                    line_cm &= line_cm - 1;
+                    f_ends[fidx] = nl_off;
+                    if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                        cb(fields);
+                    }
                 }
-                f_starts[fidx] = cur_fstart;
-                f_ends[fidx] = nl_off;
-                if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
-                    cb(fields);
+
+                let through_nl = before_nl | (1u64 << nl_bit);
+                nl &= !through_nl;
+                cm &= !through_nl;
+                qt &= !through_nl;
+
+                let next_line = nl_off + 1;
+                if next_line >= own_end {
+                    return;
                 }
+                cur_fstart = next_line;
+                fidx = 0;
+                too_many = false;
+                q_cnt = 0;
+            }
+            if had_nl {
+                blk = cur_fstart;
+                continue;
             }
 
-            let through_nl = before_nl | (1u64 << nl_bit);
-            nl &= !through_nl;
-            cm &= !through_nl;
-            qt &= !through_nl;
-
-            let next_line = nl_off + 1;
-            if next_line >= own_end {
-                return;
+            q_cnt += qt.count_ones();
+            if !too_many {
+                let rem_cm = cm.count_ones() as usize;
+                if fidx + rem_cm >= N {
+                    too_many = true;
+                } else {
+                    while cm != 0 {
+                        let cb_bit = cm.trailing_zeros();
+                        let coff = blk + cb_bit as usize;
+                        f_starts[fidx] = cur_fstart;
+                        f_ends[fidx] = coff;
+                        fidx += 1;
+                        cur_fstart = coff + 1;
+                        cm &= cm - 1;
+                    }
+                }
             }
-            cur_fstart = next_line;
-            fidx = 0;
-            too_many = false;
-            q_cnt = 0;
+            blk += 64;
         }
-
-        q_cnt += qt.count_ones();
-        if !too_many {
-            let rem_cm = cm.count_ones() as usize;
-            if fidx + rem_cm >= N {
-                too_many = true;
-            } else {
-                while cm != 0 {
-                    let cb_bit = cm.trailing_zeros();
-                    let coff = blk + cb_bit as usize;
-                    f_starts[fidx] = cur_fstart;
-                    f_ends[fidx] = coff;
-                    fidx += 1;
-                    cur_fstart = coff + 1;
-                    cm &= cm - 1;
-                }
-            }
-        }
-        blk += 64;
-    }
 }
 
 fn for_each_record_scalar<const N: usize>(
