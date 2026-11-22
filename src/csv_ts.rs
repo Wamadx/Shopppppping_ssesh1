@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 const INTERNED_BIT: u64 = 1u64 << 63;
+const INTERNED_LEN_SHIFT: u32 = 48;
+const INTERNED_LEN_MASK: u64 = 0x7fff;
+const INTERNED_PTR_MASK: u64 = (1u64 << 47) - 1;
 const NUM_INTERN_SHARDS: usize = 32;
 
 #[derive(Default)]
@@ -29,7 +32,11 @@ fn shard_of(s: &[u8]) -> usize {
 /// 8-byte order-preserving ID key.
 /// - Bit 63 == 0: 1..=9 ASCII bytes in 0x01..=0x7F packed 7 bits/char MSB-first.
 ///   Integer `<` equals byte-wise lexicographical `<`.
-/// - Bit 63 == 1: interned in 32-sharded `INTERNERS` (`bits 58..62` = shard, `bits 0..27` = local idx).
+/// - Bit 63 == 1: interned. Normally `bits 48..62` = length and `bits 0..46` =
+///   the stable pointer, so byte access needs no lock. The supported x86_64
+///   targets use user pointers below 2^47; this is checked at insertion.
+/// - Zero length bits select the legacy `(shard << 32) | idx` representation.
+///   Empty/oversized strings and unusual high pointers retain that safe path.
 /// - `Key(0)` is `EMPTY` sentinel (never produced by `from_bytes`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Key(pub u64);
@@ -110,25 +117,36 @@ impl Key {
         Some(Self(acc))
     }
 
-    #[cold]
+    #[inline]
+    fn encode_interned(sh: usize, idx: u32, s: &'static [u8]) -> Self {
+        let ptr = s.as_ptr() as usize as u64;
+        let len = s.len() as u64;
+        if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
+            Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
+        } else {
+            Self(INTERNED_BIT | ((sh as u64) << 32) | (idx as u64))
+        }
+    }
+
+    #[inline]
     fn intern_slow(s: &[u8]) -> Self {
         let sh = shard_of(s);
         let lock = &interners()[sh];
         {
             let r = lock.read().unwrap();
             if let Some(&idx) = r.map.get(s) {
-                return Self(INTERNED_BIT | ((sh as u64) << 32) | (idx as u64));
+                return Self::encode_interned(sh, idx, r.slices[idx as usize]);
             }
         }
         let mut w = lock.write().unwrap();
         if let Some(&idx) = w.map.get(s) {
-            return Self(INTERNED_BIT | ((sh as u64) << 32) | (idx as u64));
+            return Self::encode_interned(sh, idx, w.slices[idx as usize]);
         }
         let idx = w.slices.len() as u32;
         let leaked: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
         w.slices.push(leaked);
         w.map.insert(leaked, idx);
-        Self(INTERNED_BIT | ((sh as u64) << 32) | (idx as u64))
+        Self::encode_interned(sh, idx, leaked)
     }
 
     #[inline]
@@ -147,8 +165,14 @@ impl Key {
         len
     }
 
-    #[cold]
+    #[inline(always)]
     fn long_bytes(self) -> &'static [u8] {
+        let len = ((self.0 >> INTERNED_LEN_SHIFT) & INTERNED_LEN_MASK) as usize;
+        if len != 0 {
+            let ptr = (self.0 & INTERNED_PTR_MASK) as *const u8;
+            // The interned allocation is leaked, immutable, and outlives every Key.
+            return unsafe { std::slice::from_raw_parts(ptr, len) };
+        }
         let sh = ((self.0 >> 32) as usize) & (NUM_INTERN_SHARDS - 1);
         let idx = (self.0 & 0xFFFF_FFFF) as usize;
         interners()[sh].read().unwrap().slices[idx]
@@ -184,7 +208,7 @@ impl Key {
         }
     }
 
-    #[cold]
+    #[inline]
     fn cmp_bytes_slow(&self, other: &Self) -> std::cmp::Ordering {
         let mut a_buf = [0u8; 9];
         let mut b_buf = [0u8; 9];
