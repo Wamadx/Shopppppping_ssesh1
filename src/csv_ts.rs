@@ -1,32 +1,169 @@
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::cell::RefCell;
+use std::sync::{Mutex, OnceLock};
 
 const INTERNED_BIT: u64 = 1u64 << 63;
 const INTERNED_LEN_SHIFT: u32 = 48;
 const INTERNED_LEN_MASK: u64 = 0x7fff;
 const INTERNED_PTR_MASK: u64 = (1u64 << 47) - 1;
-const NUM_INTERN_SHARDS: usize = 32;
+const NUM_INTERN_SHARDS: usize = 256;
+const INTERN_ARENA_CHUNK: usize = 256 * 1024;
+const INTERN_CACHE_SLOTS: usize = 1024;
+
+#[inline(always)]
+fn hash_word(h: u64, word: u64) -> u64 {
+    (h.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95)
+}
+
+/// Fast, deterministic hash used once for the shard, table, and local cache.
+#[inline]
+fn hash_bytes(mut s: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ s.len() as u64;
+    while s.len() >= 8 {
+        let w = u64::from_le(unsafe { (s.as_ptr() as *const u64).read_unaligned() });
+        h = hash_word(h, w);
+        s = &s[8..];
+    }
+    if s.len() >= 4 {
+        let w = u32::from_le(unsafe { (s.as_ptr() as *const u32).read_unaligned() }) as u64;
+        h = hash_word(h, w);
+        s = &s[4..];
+    }
+    if s.len() >= 2 {
+        let w = u16::from_le(unsafe { (s.as_ptr() as *const u16).read_unaligned() }) as u64;
+        h = hash_word(h, w);
+        s = &s[2..];
+    }
+    if let Some(&b) = s.first() {
+        h = hash_word(h, b as u64);
+    }
+    let r = (h as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (r as u64) ^ (r >> 64) as u64
+}
+
+#[derive(Default)]
+struct InternArena {
+    // Each Vec retains its allocation; its length stays zero while offset tracks
+    // initialized bytes. Moving the Vec never moves the allocation itself.
+    chunks: Vec<Vec<u8>>,
+    offset: usize,
+}
+
+impl InternArena {
+    fn alloc(&mut self, s: &[u8]) -> &'static [u8] {
+        let need_chunk = match self.chunks.last() {
+            Some(chunk) => chunk.capacity() - self.offset < s.len(),
+            None => true,
+        };
+        if need_chunk {
+            self.chunks
+                .push(Vec::with_capacity(INTERN_ARENA_CHUNK.max(s.len())));
+            self.offset = 0;
+        }
+        let chunk = self.chunks.last_mut().unwrap();
+        let start = self.offset;
+        unsafe {
+            let ptr = chunk.as_mut_ptr().add(start);
+            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, s.len());
+            self.offset = start + s.len();
+            // INTERNERS and its arena allocations live until process exit. No
+            // later allocation writes this range or reallocates this chunk.
+            std::slice::from_raw_parts(ptr, s.len())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InternSlot {
+    hash: u64,
+    idx_plus_one: u32,
+}
 
 #[derive(Default)]
 struct Interner {
-    map: HashMap<&'static [u8], u32>,
+    slots: Vec<InternSlot>,
     slices: Vec<&'static [u8]>,
+    arena: InternArena,
 }
 
-static INTERNERS: OnceLock<[RwLock<Interner>; NUM_INTERN_SHARDS]> = OnceLock::new();
-
-fn interners() -> &'static [RwLock<Interner>; NUM_INTERN_SHARDS] {
-    INTERNERS.get_or_init(|| std::array::from_fn(|_| RwLock::new(Interner::default())))
-}
-
-#[inline]
-fn shard_of(s: &[u8]) -> usize {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in s {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
+impl Interner {
+    fn lookup(&self, s: &[u8], hash: u64) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut pos = (hash as usize) & mask;
+        loop {
+            let slot = unsafe { *self.slots.get_unchecked(pos) };
+            if slot.idx_plus_one == 0 {
+                return None;
+            }
+            let idx = slot.idx_plus_one - 1;
+            if slot.hash == hash && self.slices[idx as usize] == s {
+                return Some(idx);
+            }
+            pos = (pos + 1) & mask;
+        }
     }
-    ((h >> 32) as usize) & (NUM_INTERN_SHARDS - 1)
+
+    fn grow(&mut self) {
+        let cap = if self.slots.is_empty() {
+            1024
+        } else {
+            self.slots.len() * 2
+        };
+        let mut slots = vec![InternSlot::default(); cap];
+        let mask = cap - 1;
+        for slot in &self.slots {
+            if slot.idx_plus_one != 0 {
+                let mut pos = (slot.hash as usize) & mask;
+                while slots[pos].idx_plus_one != 0 {
+                    pos = (pos + 1) & mask;
+                }
+                slots[pos] = *slot;
+            }
+        }
+        self.slots = slots;
+    }
+
+    fn intern(&mut self, s: &[u8], hash: u64, sh: usize) -> Key {
+        if let Some(idx) = self.lookup(s, hash) {
+            return Key::encode_interned(sh, idx, self.slices[idx as usize]);
+        }
+        if self.slots.is_empty() || (self.slices.len() + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut pos = (hash as usize) & mask;
+        while self.slots[pos].idx_plus_one != 0 {
+            pos = (pos + 1) & mask;
+        }
+        let idx = u32::try_from(self.slices.len()).expect("too many interned IDs");
+        let stored = self.arena.alloc(s);
+        self.slices.push(stored);
+        self.slots[pos] = InternSlot {
+            hash,
+            idx_plus_one: idx + 1,
+        };
+        Key::encode_interned(sh, idx, stored)
+    }
+}
+
+static INTERNERS: OnceLock<[Mutex<Interner>; NUM_INTERN_SHARDS]> = OnceLock::new();
+
+fn interners() -> &'static [Mutex<Interner>; NUM_INTERN_SHARDS] {
+    INTERNERS.get_or_init(|| std::array::from_fn(|_| Mutex::new(Interner::default())))
+}
+
+#[derive(Clone, Copy)]
+struct InternCacheEntry {
+    hash: u64,
+    key: Key,
+}
+
+thread_local! {
+    static INTERN_CACHE: RefCell<[InternCacheEntry; INTERN_CACHE_SLOTS]> = const {
+        RefCell::new([InternCacheEntry { hash: 0, key: Key::EMPTY }; INTERN_CACHE_SLOTS])
+    };
 }
 
 /// 8-byte order-preserving ID key.
@@ -53,7 +190,7 @@ impl Key {
                 if let Some(k) = unsafe { Self::pack_bmi2(s) } {
                     return k;
                 }
-                return Self::intern_slow(s);
+                return Self::intern_slow(s, hash_bytes(s));
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             {
@@ -63,7 +200,7 @@ impl Key {
                 while i < len {
                     let b = s[i];
                     if b == 0 || b >= 0x80 {
-                        return Self::intern_slow(s);
+                        return Self::intern_slow(s, hash_bytes(s));
                     }
                     acc |= (b as u64) << shift;
                     shift -= 7;
@@ -72,7 +209,7 @@ impl Key {
                 return Self(acc);
             }
         }
-        Self::intern_slow(s)
+        Self::intern_slow(s, hash_bytes(s))
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -85,7 +222,8 @@ impl Key {
             u64::from_le_bytes(unsafe { *(s.as_ptr() as *const [u8; 8]) })
         } else if k >= 4 {
             let lo = u32::from_le_bytes(unsafe { *(s.as_ptr() as *const [u8; 4]) }) as u64;
-            let hi = u32::from_le_bytes(unsafe { *(s.as_ptr().add(k - 4) as *const [u8; 4]) }) as u64;
+            let hi =
+                u32::from_le_bytes(unsafe { *(s.as_ptr().add(k - 4) as *const [u8; 4]) }) as u64;
             let combined = lo | (hi << ((k - 4) * 8));
             combined & ((!0u64) >> ((8 - k) * 8))
         } else {
@@ -129,24 +267,26 @@ impl Key {
     }
 
     #[inline]
-    fn intern_slow(s: &[u8]) -> Self {
-        let sh = shard_of(s);
-        let lock = &interners()[sh];
-        {
-            let r = lock.read().unwrap();
-            if let Some(&idx) = r.map.get(s) {
-                return Self::encode_interned(sh, idx, r.slices[idx as usize]);
+    fn intern_slow(s: &[u8], hash: u64) -> Self {
+        let cache_slot = ((hash >> 24) as usize) & (INTERN_CACHE_SLOTS - 1);
+        let cached = INTERN_CACHE.with(|cache| {
+            let entry = cache.borrow()[cache_slot];
+            if entry.hash == hash && entry.key != Self::EMPTY && entry.key.long_bytes() == s {
+                Some(entry.key)
+            } else {
+                None
             }
+        });
+        if let Some(key) = cached {
+            return key;
         }
-        let mut w = lock.write().unwrap();
-        if let Some(&idx) = w.map.get(s) {
-            return Self::encode_interned(sh, idx, w.slices[idx as usize]);
-        }
-        let idx = w.slices.len() as u32;
-        let leaked: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
-        w.slices.push(leaked);
-        w.map.insert(leaked, idx);
-        Self::encode_interned(sh, idx, leaked)
+
+        let sh = ((hash >> 56) as usize) & (NUM_INTERN_SHARDS - 1);
+        let key = interners()[sh].lock().unwrap().intern(s, hash, sh);
+        INTERN_CACHE.with(|cache| {
+            cache.borrow_mut()[cache_slot] = InternCacheEntry { hash, key };
+        });
+        key
     }
 
     #[inline]
@@ -175,7 +315,7 @@ impl Key {
         }
         let sh = ((self.0 >> 32) as usize) & (NUM_INTERN_SHARDS - 1);
         let idx = (self.0 & 0xFFFF_FFFF) as usize;
-        interners()[sh].read().unwrap().slices[idx]
+        interners()[sh].lock().unwrap().slices[idx]
     }
 
     #[inline]
@@ -201,6 +341,9 @@ impl Key {
 
     #[inline]
     pub fn cmp_bytes(&self, other: &Self) -> std::cmp::Ordering {
+        if self == other {
+            return std::cmp::Ordering::Equal;
+        }
         if ((self.0 | other.0) & INTERNED_BIT) == 0 {
             self.0.cmp(&other.0)
         } else {
@@ -603,7 +746,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
-    let day_of_year = (153 * ((month + if month > 2 { -3 } else { 9 })) + 2) / 5 + day - 1;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
 }
@@ -648,13 +791,18 @@ impl DateCache {
         let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
             self.last_day_ms
         } else {
-            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> DATE_CACHE_SHIFT) as usize;
+            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> DATE_CACHE_SHIFT)
+                as usize;
             let ent = &self.entries[slot];
             let val = if ent.k0 == k0 && ent.k1 == k1 {
                 ent.day_ms
             } else {
                 let val = parse_date_10(&s[0..10]).unwrap_or(i64::MIN);
-                self.entries[slot] = DateEntry { k0, k1, day_ms: val };
+                self.entries[slot] = DateEntry {
+                    k0,
+                    k1,
+                    day_ms: val,
+                };
                 val
             };
             self.last_k0 = k0;
@@ -690,10 +838,17 @@ impl DateCache {
             }
             let off_ms = (off_h * 60 + off_m) * 60_000;
             let ms = day_ms + hms_ms;
-            return Some(if s[19] == b'+' { ms - off_ms } else { ms + off_ms });
+            return Some(if s[19] == b'+' {
+                ms - off_ms
+            } else {
+                ms + off_ms
+            });
         }
         if len == 13 {
-            if let (Some(hi8), Some(lo8)) = (parse_8_digits_swar(&s[0..8]), parse_8_digits_swar(&s[5..13])) {
+            if let (Some(hi8), Some(lo8)) = (
+                parse_8_digits_swar(&s[0..8]),
+                parse_8_digits_swar(&s[5..13]),
+            ) {
                 let lo5 = lo8 % 100_000;
                 return Some(hi8 * 100_000 + lo5);
             }
@@ -765,7 +920,10 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     }
 
     if len == 13 {
-        if let (Some(hi8), Some(lo8)) = (parse_8_digits_swar(&s[0..8]), parse_8_digits_swar(&s[5..13])) {
+        if let (Some(hi8), Some(lo8)) = (
+            parse_8_digits_swar(&s[0..8]),
+            parse_8_digits_swar(&s[5..13]),
+        ) {
             return Some(hi8 * 100_000 + (lo8 % 100_000));
         }
         return None;
@@ -798,9 +956,5 @@ pub fn parse_price_cents(s: &[u8]) -> Option<i32> {
             return None;
         }
     }
-    if val >= 1 {
-        Some(val as i32)
-    } else {
-        None
-    }
+    if val >= 1 { Some(val as i32) } else { None }
 }
