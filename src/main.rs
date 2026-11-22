@@ -70,7 +70,7 @@ impl Config {
                 .unwrap_or(chunk_kb * 1024),
             use_bitfilter: env_bool("SHOP_BITFILTER", true),
             use_sortless: env_bool("SHOP_SORTLESS", false),
-            use_prefetch: env_bool("SHOP_PREFETCH", false),
+            use_prefetch: env_bool("SHOP_PREFETCH", true),
             use_dedup_bitmap: env_bool("SHOP_DEDUP_BITMAP", true),
             use_wc: env_bool("SHOP_WC", true),
             timing: env_bool("TIMING", false),
@@ -229,6 +229,9 @@ impl LinkTable {
 
     #[inline(always)]
     fn prefetch(&self, uid: Key) {
+        if uid == Key::EMPTY {
+            return;
+        }
         let h = uid.hash64();
         if self.use_bitfilter {
             let bit = (h as usize) & self.mask;
@@ -242,6 +245,9 @@ impl LinkTable {
     /// prefetch the map slot only for IDs the filter says are linked.
     #[inline(always)]
     fn prefetch_map(&self, uid: Key) {
+        if uid == Key::EMPTY {
+            return;
+        }
         let h = uid.hash64();
         if self.use_bitfilter {
             let bit = (h as usize) & self.mask;
@@ -874,6 +880,13 @@ struct SharedBuf<T>(UnsafeCell<Vec<T>>);
 unsafe impl<T: Send> Sync for SharedBuf<T> {}
 
 #[inline(always)]
+unsafe fn uninit_vec<T>(len: usize) -> Vec<T> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
+#[inline(always)]
 fn range_of(n: usize, t: usize, tid: usize) -> (usize, usize) {
     (n * tid / t, n * (tid + 1) / t)
 }
@@ -976,8 +989,8 @@ fn rank_recs(recs: &[EndRec], ncpu: usize) -> (Vec<u64>, Vec<u32>) {
         offs[tid] = total;
         total += counts[tid];
     }
-    let ubuf = SharedBuf(UnsafeCell::new(vec![0u64; total]));
-    let hbuf = SharedBuf(UnsafeCell::new(vec![0u32; n]));
+    let ubuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u64>(total) }));
+    let hbuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u32>(n) }));
     thread::scope(|s| {
         for tid in 0..t {
             let (lo, hi) = range_of(n, t, tid);
@@ -1094,11 +1107,11 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     let p = u.partition_point(|&k| (k & IB) == 0);
     // Carry each interned key's ORIGINAL rank (p + position in the u64-sorted
     // suffix) through the byte sort; the merge must remap that original rank.
-    let mut long: Vec<LongOrderRec> = u[p..]
-        .iter()
-        .enumerate()
-        .map(|(idx, &k)| LongOrderRec::new(Key(k), p + idx))
-        .collect();
+    let ln = n - p;
+    let mut long = unsafe { uninit_vec::<LongOrderRec>(ln) };
+    for (idx, &k) in u[p..].iter().enumerate() {
+        unsafe { *long.get_unchecked_mut(idx) = LongOrderRec::new(Key(k), p + idx) };
+    }
     radix_sort_long_order(&mut long);
     let mut nu = vec![0u64; n];
     let mut remap = vec![0u32; n];
@@ -1355,9 +1368,8 @@ fn load_links_sort(
         acc += pv.len();
     }
     woff.push(acc);
-    let zero = EndRec { key: 0, refr: 0 };
-    let recs = SharedBuf(UnsafeCell::new(vec![zero; 2 * e]));
-    let mut scratch = vec![zero; 2 * e];
+    let recs = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<EndRec>(2 * e) }));
+    let mut scratch = unsafe { uninit_vec::<EndRec>(2 * e) };
     thread::scope(|s| {
         let mut hs = Vec::with_capacity(pairs_per_worker.len());
         for (w, pv) in pairs_per_worker.iter().enumerate() {
@@ -1697,9 +1709,13 @@ fn read_clicks_parallel(
                 let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                 let mut buf = Vec::new();
                 let mut chunk_clks: Vec<(Key, Key, u32, u32)> = Vec::with_capacity(8192);
-                // Long hex user IDs: probed (slot prefetched) while parsing, resolved after
-                // the chunk is parsed and before its buffer can be reused.
-                let mut hex_pending: Vec<(u32, csv_ts::HexProbe, *const u8)> = Vec::with_capacity(2048);
+                // Long hex user IDs: probed (slot prefetched) while parsing and resolved
+                // HEX_RING rows later so the prefetched line stays hot in L1d.
+                const HEX_RING: usize = 16;
+                let mut ring: [(u32, csv_ts::HexProbe, *const u8); HEX_RING] =
+                    [(0, csv_ts::HexProbe::default(), std::ptr::null()); HEX_RING];
+                let mut ring_n = 0usize;
+                let mut ring_head = 0usize;
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     if cidx >= chunks.len() {
@@ -1728,8 +1744,19 @@ fn read_clicks_parallel(
                             if ts < base_ts || ts >= window_end {
                                 return;
                             }
+                            let cslot = chunk_clks.len() as u32;
                             let raw_uid = if let Some(pr) = csv_ts::hex_user_probe(uid) {
-                                hex_pending.push((chunk_clks.len() as u32, pr, uid.as_ptr()));
+                                if ring_n == HEX_RING {
+                                    let (idx, ref op, optr) = ring[ring_head];
+                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                                    unsafe { chunk_clks.get_unchecked_mut(idx as usize) }.0 =
+                                        csv_ts::hex_user_resolve(op, os);
+                                    ring_head = (ring_head + 1) % HEX_RING;
+                                    ring_n -= 1;
+                                }
+                                let rslot = (ring_head + ring_n) % HEX_RING;
+                                ring[rslot] = (cslot, pr, uid.as_ptr());
+                                ring_n += 1;
                                 Key::EMPTY
                             } else {
                                 Key::from_bytes(uid)
@@ -1743,12 +1770,14 @@ fn read_clicks_parallel(
                             ));
                         },
                     );
-                    for &(idx, ref pr, ptr) in hex_pending.iter() {
-                        let s = unsafe { std::slice::from_raw_parts(ptr, 33) };
+                    while ring_n > 0 {
+                        let (idx, ref op, optr) = ring[ring_head];
+                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
                         unsafe { chunk_clks.get_unchecked_mut(idx as usize) }.0 =
-                            csv_ts::hex_user_resolve(pr, s);
+                            csv_ts::hex_user_resolve(op, os);
+                        ring_head = (ring_head + 1) % HEX_RING;
+                        ring_n -= 1;
                     }
-                    hex_pending.clear();
                     let n = chunk_clks.len();
                     for i in 0..n {
                         if i + 32 < n {
@@ -1775,6 +1804,28 @@ fn read_clicks_parallel(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     Ok(WorkerMatrix::new(workers))
+}
+
+#[inline]
+fn insertion_sort_clicks(arr: &mut [CompactClick]) {
+    for i in 1..arr.len() {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0 {
+            let prev = arr[j - 1];
+            let gt = if key.ts_rel != prev.ts_rel {
+                key.ts_rel < prev.ts_rel
+            } else {
+                key.click_id.cmp_bytes(&prev.click_id) == std::cmp::Ordering::Greater
+            };
+            if !gt {
+                break;
+            }
+            arr[j] = prev;
+            j -= 1;
+        }
+        arr[j] = key;
+    }
 }
 
 #[inline]
@@ -2165,8 +2216,14 @@ fn read_events_tickets(
                             else {
                                 return;
                             };
-                            let ing_rel = ingest_ts.div_euclid(1000) - ingest_base_s;
-                            if ingest_ts.rem_euclid(1000) != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
+                            let (ing_sec, ing_rem) = if ingest_ts >= 0 {
+                                let u = ingest_ts as u64;
+                                ((u / 1000) as i64, (u % 1000) as i64)
+                            } else {
+                                (ingest_ts.div_euclid(1000), ingest_ts.rem_euclid(1000))
+                            };
+                            let ing_rel = ing_sec - ingest_base_s;
+                            if ing_rem != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
                                 bad = true;
                                 return;
                             }
@@ -2309,6 +2366,12 @@ impl TicketTable {
     }
 
     #[inline(always)]
+    fn prefetch(&self, eid: Key) {
+        let idx = (eid.eid_hash64() as usize) & self.mask;
+        prefetch_ro(self.slots.as_ptr().wrapping_add(idx));
+    }
+
+    #[inline(always)]
     fn get_or_insert(&mut self, eid: Key, kept: &[(Ticket, u32)], arenas: &[EidArena]) -> Option<usize> {
         let h = eid.eid_hash64();
         let tag = (h >> 23) & 0xFFFF_FFFF;
@@ -2386,9 +2449,11 @@ fn dedup_route_tickets(
                                 let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
                                 let (w, m) = (b >> 6, 1u64 << (b & 63));
                                 let sw = unsafe { seen_bm.get_unchecked_mut(w) };
-                                let hit = *sw & m;
-                                *sw |= m;
-                                unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                                if (*sw & m) == 0 {
+                                    *sw |= m;
+                                } else {
+                                    unsafe { *dup_bm.get_unchecked_mut(w) |= m };
+                                }
                             }
                         }
                     }
@@ -2411,7 +2476,12 @@ fn dedup_route_tickets(
                     }
                     table.reset(cand.len());
                     kept.clear();
-                    for &(tk, t) in cand.iter() {
+                    let clen = cand.len();
+                    for i in 0..clen {
+                        if i + 16 < clen {
+                            table.prefetch(unsafe { cand.get_unchecked(i + 16) }.0.event_id);
+                        }
+                        let (tk, t) = unsafe { *cand.get_unchecked(i) };
                         if let Some(pos) = table.get_or_insert(tk.event_id, &kept, eid_arenas_ref) {
                             let cur = unsafe { kept.get_unchecked_mut(pos) };
                             if tk.ingest_s < cur.0.ingest_s {
@@ -2784,7 +2854,9 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        unsafe { sorted_evs.set_len(total_evs) };
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2837,14 +2909,10 @@ fn main() -> io::Result<()> {
                     }
                     clk_offs[num_people] = cacc;
 
-                    sorted_clks.resize(
-                        clk_tmp.len(),
-                        CompactClick {
-                            ts_rel: 0,
-                            campaign_idx: 0,
-                            click_id: Key::EMPTY,
-                        },
-                    );
+                    let nclks = clk_tmp.len();
+                    sorted_clks.clear();
+                    sorted_clks.reserve(nclks);
+                    unsafe { sorted_clks.set_len(nclks) };
                     for &(lpid, cc) in &clk_tmp {
                         let dst = clk_counts[lpid as usize] as usize;
                         clk_counts[lpid as usize] = (dst + 1) as u32;
@@ -2856,7 +2924,11 @@ fn main() -> io::Result<()> {
                         let pevs = &mut sorted_evs[ev_offs[p] as usize..ev_offs[p + 1] as usize];
                         let pclks =
                             &mut sorted_clks[clk_offs[p] as usize..clk_offs[p + 1] as usize];
-                        if pclks.len() > 1 {
+                        if pclks.len() <= 16 {
+                            if pclks.len() > 1 {
+                                insertion_sort_clicks(pclks);
+                            }
+                        } else {
                             pclks.sort_unstable_by(|a, b| {
                                 a.ts_rel
                                     .cmp(&b.ts_rel)

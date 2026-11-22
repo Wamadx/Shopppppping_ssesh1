@@ -1275,18 +1275,25 @@ fn parse_4(s: &[u8]) -> Option<i64> {
 }
 
 #[inline(always)]
-fn parse_8_digits_swar(bytes: &[u8]) -> Option<i64> {
-    let w = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let sub30 = w.wrapping_sub(0x3030_3030_3030_3030);
-    let over39 = w.wrapping_add(0x4646_4646_4646_4646);
-    if ((w | sub30 | over39) & 0x8080_8080_8080_8080) != 0 {
+fn parse_13_digits_swar(bytes: &[u8]) -> Option<i64> {
+    let w0 = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+    let sub0 = w0.wrapping_sub(0x3030_3030_3030_3030);
+    let over0 = w0.wrapping_add(0x4646_4646_4646_4646);
+    let sub1 = w1.wrapping_sub(0x3030_3030_3030_3030);
+    let over1 = w1.wrapping_add(0x4646_4646_4646_4646);
+    if (((w0 | sub0 | over0) | (w1 | sub1 | over1)) & 0x8080_8080_8080_8080) != 0 {
         return None;
     }
-    let mut v = sub30;
-    v = (v.wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
-    v = (v.wrapping_mul(6_553_601) >> 16) & 0x0000_FFFF_0000_FFFF;
-    v = (v.wrapping_mul(42_949_672_960_001) >> 32) & 0xFFFF_FFFF;
-    Some(v as i64)
+    let d0 = sub0;
+    let d1 = sub1 & 0xFFFF_FFFF_FF00_0000;
+    let p0_2 = d0.wrapping_mul(2561) >> 8;
+    let p1_2 = d1.wrapping_mul(2561) >> 8;
+    let p0_4 = (p0_2 & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    let p1_4 = (p1_2 & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    let hi8 = ((p0_4 & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32) as i64;
+    let lo5 = ((p1_4 & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32) as i64;
+    Some(hi8 * 100_000 + lo5)
 }
 
 #[inline(always)]
@@ -1364,7 +1371,7 @@ impl DateCache {
         let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
             self.last_day_ms
         } else {
-            let slot = ((k0 ^ ((k1 as u64) << 48)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> DATE_CACHE_SHIFT)
+            let slot = ((k0 ^ ((k1 as u64) << 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> DATE_CACHE_SHIFT)
                 as usize;
             let ent = &self.entries[slot];
             let val = if ent.k0 == k0 && ent.k1 == k1 {
@@ -1393,6 +1400,12 @@ impl DateCache {
             let day_ms = self.cached_day_ms(s)?;
             let hms_ms = parse_hms_swar(&s[11..19])?;
             return Some((day_ms + hms_ms, day_ms));
+        }
+        if len == 13 {
+            let ts = parse_13_digits_swar(s)?;
+            let u = ts as u64;
+            let day_ms = (u - (u % 86_400_000)) as i64;
+            return Some((ts, day_ms));
         }
         let ts = self.parse_ts(s)?;
         Some((ts, ts - ts.rem_euclid(86_400_000)))
@@ -1452,13 +1465,7 @@ impl DateCache {
             });
         }
         if len == 13 {
-            if let (Some(hi8), Some(lo8)) = (
-                parse_8_digits_swar(&s[0..8]),
-                parse_8_digits_swar(&s[5..13]),
-            ) {
-                let lo5 = lo8 % 100_000;
-                return Some(hi8 * 100_000 + lo5);
-            }
+            return parse_13_digits_swar(s);
         }
         parse_ts(s)
     }
@@ -1527,13 +1534,7 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     }
 
     if len == 13 {
-        if let (Some(hi8), Some(lo8)) = (
-            parse_8_digits_swar(&s[0..8]),
-            parse_8_digits_swar(&s[5..13]),
-        ) {
-            return Some(hi8 * 100_000 + (lo8 % 100_000));
-        }
-        return None;
+        return parse_13_digits_swar(s);
     }
 
     if s.iter().all(|&b| b.is_ascii_digit()) {
