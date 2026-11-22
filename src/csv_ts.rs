@@ -537,6 +537,23 @@ impl Key {
 
     #[inline]
     fn cmp_bytes_slow(&self, other: &Self) -> std::cmp::Ordering {
+        if (self.0 & other.0 & INTERNED_BIT) != 0 {
+            let a = self.long_bytes();
+            let b = other.long_bytes();
+            if a.len() >= 8 && b.len() >= 8 {
+                // Long generated IDs almost always differ in their first eight
+                // bytes. Avoid constructing two slices into memcmp on every
+                // comparison in the link rank and click tie-break sorts.
+                let aw = u64::from_le(unsafe { (a.as_ptr() as *const u64).read_unaligned() })
+                    .swap_bytes();
+                let bw = u64::from_le(unsafe { (b.as_ptr() as *const u64).read_unaligned() })
+                    .swap_bytes();
+                if aw != bw {
+                    return aw.cmp(&bw);
+                }
+            }
+            return a.cmp(b);
+        }
         let mut a_buf = [0u8; 9];
         let mut b_buf = [0u8; 9];
         let a_slice: &[u8] = if (self.0 & INTERNED_BIT) == 0 {
