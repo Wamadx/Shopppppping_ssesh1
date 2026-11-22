@@ -132,6 +132,66 @@ mod linux_sys {
         res
     }
 
+    // Freed huge blocks are kept for reuse instead of leaked: a later phase's buffers land on
+    // pages that are already faulted in, so the kernel does not zero fresh 2 MiB pages again.
+    const MAX_FREE: usize = 4096;
+    static FREE_LOCK: AtomicUsize = AtomicUsize::new(0);
+    static FREE_N: AtomicUsize = AtomicUsize::new(0);
+    static FREE_ADDR: [AtomicUsize; MAX_FREE] = [const { AtomicUsize::new(0) }; MAX_FREE];
+    static FREE_LEN: [AtomicUsize; MAX_FREE] = [const { AtomicUsize::new(0) }; MAX_FREE];
+
+    #[inline]
+    fn free_lock() {
+        while FREE_LOCK
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Best fit among freed blocks with need <= len <= 2 * need + 4 MiB.
+    unsafe fn take_free(need: usize) -> *mut u8 {
+        let need = (need.max(HUGE_PAGE) + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+        free_lock();
+        let n = FREE_N.load(Ordering::Relaxed);
+        let mut best = usize::MAX;
+        let mut best_len = usize::MAX;
+        for i in 0..n {
+            let l = FREE_LEN[i].load(Ordering::Relaxed);
+            if l >= need && l < best_len && l <= need * 2 + (4 << 20) {
+                best = i;
+                best_len = l;
+                if l == need {
+                    break;
+                }
+            }
+        }
+        let res = if best != usize::MAX {
+            let a = FREE_ADDR[best].load(Ordering::Relaxed);
+            FREE_ADDR[best].store(FREE_ADDR[n - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+            FREE_LEN[best].store(FREE_LEN[n - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+            FREE_N.store(n - 1, Ordering::Relaxed);
+            a as *mut u8
+        } else {
+            ptr::null_mut()
+        };
+        FREE_LOCK.store(0, Ordering::Release);
+        res
+    }
+
+    unsafe fn put_free(p: *mut u8, size: usize) {
+        let len = (size.max(HUGE_PAGE) + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+        free_lock();
+        let n = FREE_N.load(Ordering::Relaxed);
+        if n < MAX_FREE {
+            FREE_ADDR[n].store(p as usize, Ordering::Relaxed);
+            FREE_LEN[n].store(len, Ordering::Relaxed);
+            FREE_N.store(n + 1, Ordering::Relaxed);
+        }
+        FREE_LOCK.store(0, Ordering::Release);
+    }
+
     /// Bypasses musl `mallocng` lock contention and 4 KiB page-fault overhead for >=32 KiB allocations.
     pub struct HugeBlocks;
 
@@ -140,6 +200,10 @@ mod linux_sys {
             let size = layout.size();
             let align = layout.align();
             if size >= HUGE_PAGE && align <= HUGE_PAGE {
+                let r = unsafe { take_free(size) };
+                if !r.is_null() {
+                    return r;
+                }
                 let (p, _) = unsafe { map_huge_aligned(size) };
                 return p;
             }
@@ -152,8 +216,12 @@ mod linux_sys {
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             let size = layout.size();
             let align = layout.align();
-            // Fresh anonymous mmap slabs are guaranteed kernel-zeroed and never recycled.
-            if (size >= HUGE_PAGE || size >= MED_MIN) && align <= HUGE_PAGE {
+            // Fresh anonymous mmap slabs are kernel-zeroed; recycled huge blocks are not, so
+            // zeroed requests always take a fresh mapping.
+            if size >= HUGE_PAGE && align <= HUGE_PAGE {
+                return unsafe { map_huge_aligned(size).0 };
+            }
+            if size >= MED_MIN && align <= HUGE_PAGE {
                 return unsafe { self.alloc(layout) };
             }
             unsafe { System.alloc_zeroed(layout) }
@@ -166,7 +234,7 @@ mod linux_sys {
                 // Never munmap mid-run: each unmap takes the mmap write lock and triggers TLB
                 // shootdowns on every worker. Peak RSS rises ~8% (2.25 GB at 20M; 24 GB limit),
                 // and _exit reclaims everything.
-                let _ = ptr;
+                unsafe { put_free(ptr, size) };
                 return;
             }
             if size >= MED_MIN && align <= HUGE_PAGE {
