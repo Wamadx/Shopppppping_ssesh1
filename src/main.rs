@@ -360,13 +360,13 @@ impl DedupTable {
 
     #[inline(always)]
     fn prefetch(&self, eid: Key) {
-        let idx = (eid.equality_hash64() as usize) & self.mask;
+        let idx = (eid.hash64() as usize) & self.mask;
         prefetch_ro(self.slots.as_ptr().wrapping_add(idx));
     }
 
     #[inline(always)]
     fn get_or_insert(&mut self, ev: RawEvent, kept: &[RawEvent]) -> Option<u32> {
-        let h = ev.event_id.equality_hash64();
+        let h = ev.event_id.hash64();
         let tag = (h >> 23) & 0xFFFF_FFFF;
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -379,7 +379,7 @@ impl DedupTable {
             }
             if (slot_val >> 32) == tag {
                 let pos = ((slot_val as u32) - 1) as usize;
-                if unsafe { kept.get_unchecked(pos) }.event_id.equality_eq(ev.event_id) {
+                if unsafe { kept.get_unchecked(pos) }.event_id == ev.event_id {
                     return Some(pos as u32);
                 }
             }
@@ -1507,13 +1507,13 @@ fn read_events_parallel(
                                 }
                             }
 
-                            let event_id = Key::from_bytes_equality(eid);
+                            let event_id = Key::from_bytes(eid);
                             let user_id = if ts_rel != u32::MAX {
                                 Key::from_bytes(uid)
                             } else {
                                 Key::EMPTY
                             };
-                            let shard = (event_id.equality_hash64() >> DEDUP_SHIFT) as usize;
+                            let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
                             wc.push(
                                 shard,
                                 RawEvent {
@@ -1797,7 +1797,7 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
                             for t in 0..ew {
                                 let raw = unsafe { event_shards.get_mut(t, sh) };
                                 for ev in raw.iter() {
-                                    let b = ((ev.event_id.equality_hash64() >> 8) as usize) & bm_mask;
+                                    let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
                                     let (w, m) = (b >> 6, 1u64 << (b & 63));
                                     let sw = unsafe { seen_bm.get_unchecked_mut(w) };
                                     let hit = *sw & m;
@@ -1816,7 +1816,7 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
                                 }
                                 let ev = raw[i];
                                 if bm_on {
-                                    let b = ((ev.event_id.equality_hash64() >> 8) as usize) & bm_mask;
+                                    let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
                                     if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
                                         if ev.ts_rel != u32::MAX {
                                             if i + 16 < rlen && raw[i + 16].ts_rel != u32::MAX {
@@ -2025,7 +2025,7 @@ fn read_events_tickets(
                                 }
                             }
 
-                            let event_id = Key::from_bytes_equality(eid);
+                            let event_id = Key::from_bytes(eid);
                             let loc = if ts_rel != u32::MAX {
                                 let l = payloads.len();
                                 if l >= loc_max {
@@ -2040,7 +2040,7 @@ fn read_events_tickets(
                             } else {
                                 LOC_NONE
                             };
-                            let shard = (event_id.equality_hash64() >> DEDUP_SHIFT) as usize;
+                            let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
                             wc.push(
                                 shard,
                                 Ticket {
@@ -2091,7 +2091,7 @@ impl TicketTable {
 
     #[inline(always)]
     fn get_or_insert(&mut self, eid: Key, kept: &[(Ticket, u32)]) -> Option<usize> {
-        let h = eid.equality_hash64();
+        let h = eid.hash64();
         let tag = (h >> 23) & 0xFFFF_FFFF;
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -2102,7 +2102,7 @@ impl TicketTable {
             }
             if (slot_val >> 32) == tag {
                 let pos = ((slot_val as u32) - 1) as usize;
-                if unsafe { kept.get_unchecked(pos) }.0.event_id.equality_eq(eid) {
+                if unsafe { kept.get_unchecked(pos) }.0.event_id == eid {
                     return Some(pos);
                 }
             }
@@ -2162,7 +2162,7 @@ fn dedup_route_tickets(
                         dup_bm.resize(words, 0);
                         for t in 0..ew {
                             for tk in unsafe { tickets.get_mut(t, sh) }.iter() {
-                                let b = ((tk.event_id.equality_hash64() >> 8) as usize) & bm_mask;
+                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
                                 let (w, m) = (b >> 6, 1u64 << (b & 63));
                                 let sw = unsafe { seen_bm.get_unchecked_mut(w) };
                                 let hit = *sw & m;
@@ -2176,7 +2176,7 @@ fn dedup_route_tickets(
                         let raw = unsafe { tickets.get_mut(t, sh) };
                         for tk in raw.iter() {
                             if bm_on {
-                                let b = ((tk.event_id.equality_hash64() >> 8) as usize) & bm_mask;
+                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
                                 if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
                                     continue;
                                 }
