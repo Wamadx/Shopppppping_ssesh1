@@ -238,6 +238,21 @@ impl LinkTable {
         }
     }
 
+    /// Second prefetch stage: once the bitfilter word is cached (an earlier `prefetch`),
+    /// prefetch the map slot only for IDs the filter says are linked.
+    #[inline(always)]
+    fn prefetch_map(&self, uid: Key) {
+        let h = uid.hash64();
+        if self.use_bitfilter {
+            let bit = (h as usize) & self.mask;
+            let word = unsafe { *self.non_canonical.get_unchecked(bit >> 6) };
+            if ((word >> (bit & 63)) & 1) == 0 {
+                return;
+            }
+        }
+        self.map_for(h).prefetch_with_hash(h);
+    }
+
     #[inline(always)]
     fn resolve(&self, uid: Key, cache: &mut [(Key, Key); 1024]) -> Key {
         let h = uid.hash64();
@@ -1736,8 +1751,11 @@ fn read_clicks_parallel(
                     hex_pending.clear();
                     let n = chunk_clks.len();
                     for i in 0..n {
+                        if i + 32 < n {
+                            links.prefetch(unsafe { chunk_clks.get_unchecked(i + 32) }.0);
+                        }
                         if i + 16 < n {
-                            links.prefetch(unsafe { chunk_clks.get_unchecked(i + 16) }.0);
+                            links.prefetch_map(unsafe { chunk_clks.get_unchecked(i + 16) }.0);
                         }
                         let (raw_uid, click_id, ts_rel, campaign_idx) =
                             unsafe { *chunk_clks.get_unchecked(i) };
@@ -2448,8 +2466,11 @@ fn dedup_route_tickets(
                     let sl = &payloads_ref[t][st..en];
                     let n = sl.len();
                     for i in 0..n {
+                        if i + 32 < n {
+                            links.prefetch(unsafe { sl.get_unchecked(i + 32) }.user_id);
+                        }
                         if i + 16 < n {
-                            links.prefetch(unsafe { sl.get_unchecked(i + 16) }.user_id);
+                            links.prefetch_map(unsafe { sl.get_unchecked(i + 16) }.user_id);
                         }
                         let p = unsafe { *sl.get_unchecked(i) };
                         if p.user_id == Key::EMPTY {
