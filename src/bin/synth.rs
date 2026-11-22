@@ -26,6 +26,13 @@ impl Rng {
     }
 }
 
+#[inline(always)]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 fn push_uid(out: &mut String, person: u64, dev: u64, rng: &mut Rng) {
     let q = rng.pct(200);
     if q {
@@ -33,7 +40,13 @@ fn push_uid(out: &mut String, person: u64, dev: u64, rng: &mut Rng) {
     }
     let idx = person * 8 + dev;
     use std::fmt::Write;
-    let _ = write!(out, "u{:x}", 100_000 + idx);
+    let sel = mix64(idx ^ 0xD6E8_FEB8_6659_FD93);
+    if (sel & 7) == 0 {
+        let h2 = mix64(sel ^ 0x9E37_79B9_7F4A_7C15);
+        let _ = write!(out, "u{:016x}{:016x}", sel, h2);
+    } else {
+        let _ = write!(out, "u{:x}", 100_000 + idx);
+    }
     if q {
         out.push('"');
     }
@@ -212,7 +225,13 @@ fn main() -> io::Result<()> {
             };
 
             line.clear();
-            let eid_str = format!("e{:07x}", i + 1);
+            let eid_str = if (i & 7) == 0 {
+                let h1 = mix64((i as u64).wrapping_add(0x1111_2222_3333_4444));
+                let h2 = mix64(h1 ^ 0x5555_6666_7777_8888);
+                format!("e{:016x}{:016x}", h1, h2)
+            } else {
+                format!("e{:07x}", i + 1)
+            };
             push_field_str(&mut line, &eid_str, &mut rng);
             line.push(',');
             if rng.pct(2) {
@@ -294,7 +313,13 @@ fn main() -> io::Result<()> {
                 format!("c_{}", 1 + rng.gen_range(2_000))
             };
             line.clear();
-            let clid_str = format!("k{:07x}", i + 1);
+            let clid_str = if (i & 7) == 0 {
+                let h1 = mix64((i as u64).wrapping_add(0xAAAA_BBBB_CCCC_DDDD));
+                let h2 = mix64(h1 ^ 0x2222_4444_6666_8888);
+                format!("k{:016x}{:016x}", h1, h2)
+            } else {
+                format!("k{:07x}", i + 1)
+            };
             push_field_str(&mut line, &clid_str, &mut rng);
             line.push(',');
             push_uid(&mut line, p, dev, &mut rng);

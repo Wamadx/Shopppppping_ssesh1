@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Instant;
 
 use csv_ts::{
-    DateCache, Key, for_each_line, for_each_record_simd, parse_fields, parse_price_cents,
+    DateCache, EidArena, Key, for_each_line, for_each_record_simd, parse_fields, parse_price_cents,
     parse_ts, skip_header,
 };
 use parquet::{CampaignDailyRow, UserDailyWriter, write_campaign_daily};
@@ -407,7 +407,7 @@ impl LocalPersonMap {
     }
 
     fn reset(&mut self, needed: usize) {
-        let cap = needed.saturating_mul(2).max(1024).next_power_of_two();
+        let cap = (needed / 4).max(1024).next_power_of_two();
         if cap > self.entries.len() {
             self.entries.resize(cap, (0, 0));
             self.stamps.resize(cap, 0);
@@ -418,6 +418,29 @@ impl LocalPersonMap {
             self.stamps.fill(0);
             self.epoch = 1;
         }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let old_cap = self.mask + 1;
+        let new_cap = old_cap * 2;
+        let mut new_entries = vec![(0u64, 0u32); new_cap];
+        let mut new_stamps = vec![0u16; new_cap];
+        let new_mask = new_cap - 1;
+        for i in 0..old_cap {
+            if self.stamps[i] == self.epoch {
+                let (k, id) = self.entries[i];
+                let mut idx = (Key(k).hash64() as usize) & new_mask;
+                while new_stamps[idx] == self.epoch {
+                    idx = (idx + 1) & new_mask;
+                }
+                new_stamps[idx] = self.epoch;
+                new_entries[idx] = (k, id);
+            }
+        }
+        self.entries = new_entries;
+        self.stamps = new_stamps;
+        self.mask = new_mask;
     }
 
     #[inline(always)]
@@ -438,6 +461,9 @@ impl LocalPersonMap {
                 unsafe {
                     *self.stamps.get_unchecked_mut(idx) = self.epoch;
                     *self.entries.get_unchecked_mut(idx) = (k, id);
+                }
+                if ((*next_id as usize) * 2) >= self.mask + 1 {
+                    self.grow();
                 }
                 return (id, true);
             }
@@ -1524,7 +1550,8 @@ fn read_events_parallel(
                             if eid.is_empty() {
                                 return;
                             }
-                            let Some(ingest_ts) = dc_ing.parse_ts(ing_b) else {
+                            let Some((ingest_ts, ing_day_ms)) = dc_ing.parse_ts_with_day(ing_b)
+                            else {
                                 return;
                             };
 
@@ -1534,7 +1561,9 @@ fn read_events_parallel(
                             if !uid.is_empty() && !pid.is_empty() {
                                 match etype {
                                     b"view" | b"cart" => {
-                                        if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                        if let Some(ts) =
+                                            dc_ts.parse_ts_with_hint(ts_b, ing_b, ing_day_ms)
+                                        {
                                             if ts >= window_start
                                                 && ts < window_end
                                                 && ingest_ts - ts <= DAY_MS
@@ -1545,7 +1574,9 @@ fn read_events_parallel(
                                     }
                                     b"purchase" => {
                                         if let Some(p) = parse_price_cents(price_b) {
-                                            if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                            if let Some(ts) =
+                                                dc_ts.parse_ts_with_hint(ts_b, ing_b, ing_day_ms)
+                                            {
                                                 if ts >= window_start
                                                     && ts < window_end
                                                     && ingest_ts - ts <= DAY_MS
@@ -1562,7 +1593,7 @@ fn read_events_parallel(
                                 }
                             }
 
-                            let event_id = Key::from_bytes_unique(eid);
+                            let event_id = Key::from_bytes(eid);
                             let user_id = if ts_rel != u32::MAX {
                                 Key::from_bytes(uid)
                             } else {
@@ -1949,7 +1980,7 @@ const _: () = assert!(std::mem::size_of::<Payload>() == 16);
 
 enum EventsOut {
     Legacy(WorkerMatrix<RawEvent>),
-    Tickets(WorkerMatrix<Ticket>, Vec<Vec<Payload>>),
+    Tickets(WorkerMatrix<Ticket>, Vec<Vec<Payload>>, Vec<EidArena>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1964,10 +1995,10 @@ fn read_events_dispatch(
     unknown_cat_id: u16,
 ) -> io::Result<EventsOut> {
     if cfg.use_tickets {
-        if let Some((tk, pl)) =
+        if let Some((tk, pl, ea)) =
             read_events_tickets(paths, ncpu, cfg, base_ts, window_start, window_end, products, unknown_cat_id)?
         {
-            return Ok(EventsOut::Tickets(tk, pl));
+            return Ok(EventsOut::Tickets(tk, pl, ea));
         }
         if cfg.timing {
             eprintln!("TICKETS bail: falling back to the 32 B RawEvent path");
@@ -1979,7 +2010,7 @@ fn read_events_dispatch(
 }
 
 /// Ticket parse. Returns `Ok(None)` (caller re-parses on the legacy path) if any `ingest_ts` is not a
-/// whole second, falls outside the u32 seconds range, or a worker's payload index would overflow.
+/// whole second, falls outside the u32 seconds range, or a worker's payload/eid arena overflows.
 #[allow(clippy::too_many_arguments)]
 fn read_events_tickets(
     paths: &[PathBuf],
@@ -1990,43 +2021,49 @@ fn read_events_tickets(
     window_end: i64,
     products: &ProductCatalog,
     unknown_cat_id: u16,
-) -> io::Result<Option<(WorkerMatrix<Ticket>, Vec<Vec<Payload>>)>> {
+) -> io::Result<Option<(WorkerMatrix<Ticket>, Vec<Vec<Payload>>, Vec<EidArena>)>> {
     let (files, chunks) = plan_file_chunks(paths, cfg.chunk_bytes)?;
     if chunks.is_empty() {
-        return Ok(Some((WorkerMatrix::new(Vec::new()), Vec::new())));
+        return Ok(Some((WorkerMatrix::new(Vec::new()), Vec::new(), Vec::new())));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
     // >= 2048 tickets (32 KiB) keeps every shard Vec on the huge-page slab allocator, not musl malloc.
     let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(2048);
     let per_worker_payload_cap = ((total_bytes / 52) as usize / ncpu).max(1024);
+    let eid_arena_cap = ((total_bytes / 56) as usize / ncpu / 7).max(4096) * 36;
     let ingest_base_s = base_ts.div_euclid(1000) - (1i64 << 31);
     let loc_max = cfg.ticket_loc_max as usize;
     let bail = AtomicBool::new(false);
     let next_chunk = AtomicUsize::new(0);
-    let workers: Vec<(Vec<Vec<Ticket>>, Vec<Payload>)> = thread::scope(|s| {
+    let workers: Vec<(Vec<Vec<Ticket>>, Vec<Payload>, EidArena)> = thread::scope(|s| {
+        let files_ref = &files;
+        let chunks_ref = &chunks;
+        let next_ref = &next_chunk;
+        let bail_ref = &bail;
         let mut handles = Vec::with_capacity(ncpu);
-        for _ in 0..ncpu {
-            handles.push(s.spawn(|| {
+        for tid in 0..ncpu {
+            handles.push(s.spawn(move || {
                 let mut out: Vec<Vec<Ticket>> = (0..NUM_DEDUP_SHARDS)
                     .map(|_| Vec::with_capacity(per_shard_cap))
                     .collect();
                 let mut payloads: Vec<Payload> = Vec::with_capacity(per_worker_payload_cap);
+                let mut eid_arena = EidArena::with_capacity(eid_arena_cap);
                 let mut wc: WcSink<Ticket, 4> = WcSink::new(NUM_DEDUP_SHARDS, cfg.use_wc);
                 let mut dc_ing = DateCache::new();
                 let mut dc_ts = DateCache::new();
                 let mut buf = Vec::new();
                 let mut bad = false;
                 loop {
-                    if bad || bail.load(Ordering::Relaxed) {
+                    if bad || bail_ref.load(Ordering::Relaxed) {
                         break;
                     }
-                    let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    if cidx >= chunks.len() {
+                    let cidx = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if cidx >= chunks_ref.len() {
                         break;
                     }
-                    let ch = &chunks[cidx];
+                    let ch = &chunks_ref[cidx];
                     let (start, own_end, scan_len) =
-                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                        load_chunk_lines(&files_ref[ch.file_idx], ch, &mut buf)
                             .expect("failed to read event chunk");
                     for_each_record_simd::<7>(
                         &buf,
@@ -2037,7 +2074,8 @@ fn read_events_tickets(
                             if bad || eid.is_empty() {
                                 return;
                             }
-                            let Some(ingest_ts) = dc_ing.parse_ts(ing_b) else {
+                            let Some((ingest_ts, ing_day_ms)) = dc_ing.parse_ts_with_day(ing_b)
+                            else {
                                 return;
                             };
                             let ing_rel = ingest_ts.div_euclid(1000) - ingest_base_s;
@@ -2052,7 +2090,9 @@ fn read_events_tickets(
                             if !uid.is_empty() && !pid.is_empty() {
                                 match etype {
                                     b"view" | b"cart" => {
-                                        if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                        if let Some(ts) =
+                                            dc_ts.parse_ts_with_hint(ts_b, ing_b, ing_day_ms)
+                                        {
                                             if ts >= window_start
                                                 && ts < window_end
                                                 && ingest_ts - ts <= DAY_MS
@@ -2063,7 +2103,9 @@ fn read_events_tickets(
                                     }
                                     b"purchase" => {
                                         if let Some(p) = parse_price_cents(price_b) {
-                                            if let Some(ts) = dc_ts.parse_ts(ts_b) {
+                                            if let Some(ts) =
+                                                dc_ts.parse_ts_with_hint(ts_b, ing_b, ing_day_ms)
+                                            {
                                                 if ts >= window_start
                                                     && ts < window_end
                                                     && ingest_ts - ts <= DAY_MS
@@ -2080,7 +2122,10 @@ fn read_events_tickets(
                                 }
                             }
 
-                            let event_id = Key::from_bytes_unique(eid);
+                            let Some(event_id) = eid_arena.encode(eid, tid) else {
+                                bad = true;
+                                return;
+                            };
                             let loc = if ts_rel != u32::MAX {
                                 let l = payloads.len();
                                 if l >= loc_max {
@@ -2095,7 +2140,7 @@ fn read_events_tickets(
                             } else {
                                 LOC_NONE
                             };
-                            let shard = (event_id.hash64() >> DEDUP_SHIFT) as usize;
+                            let shard = (event_id.eid_hash64() >> DEDUP_SHIFT) as usize;
                             wc.push(
                                 shard,
                                 Ticket {
@@ -2109,10 +2154,10 @@ fn read_events_tickets(
                     );
                 }
                 if bad {
-                    bail.store(true, Ordering::Relaxed);
+                    bail_ref.store(true, Ordering::Relaxed);
                 }
                 wc.finish(&mut out);
-                (out, payloads)
+                (out, payloads, eid_arena)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -2120,8 +2165,15 @@ fn read_events_tickets(
     if bail.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    let (tickets, payloads): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
-    Ok(Some((WorkerMatrix::new(tickets), payloads)))
+    let mut tickets = Vec::with_capacity(workers.len());
+    let mut payloads = Vec::with_capacity(workers.len());
+    let mut eid_arenas = Vec::with_capacity(workers.len());
+    for (t, p, a) in workers {
+        tickets.push(t);
+        payloads.push(p);
+        eid_arenas.push(a);
+    }
+    Ok(Some((WorkerMatrix::new(tickets), payloads, eid_arenas)))
 }
 
 /// Exact dedup table over the (few) tickets that the seen/dup bitmap could not prove unique.
@@ -2145,8 +2197,8 @@ impl TicketTable {
     }
 
     #[inline(always)]
-    fn get_or_insert(&mut self, eid: Key, kept: &[(Ticket, u32)]) -> Option<usize> {
-        let h = eid.hash64();
+    fn get_or_insert(&mut self, eid: Key, kept: &[(Ticket, u32)], arenas: &[EidArena]) -> Option<usize> {
+        let h = eid.eid_hash64();
         let tag = (h >> 23) & 0xFFFF_FFFF;
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -2157,7 +2209,7 @@ impl TicketTable {
             }
             if (slot_val >> 32) == tag {
                 let pos = ((slot_val as u32) - 1) as usize;
-                if unsafe { kept.get_unchecked(pos) }.0.event_id == eid {
+                if unsafe { kept.get_unchecked(pos) }.0.event_id.eid_eq(eid, arenas) {
                     return Some(pos);
                 }
             }
@@ -2173,6 +2225,7 @@ impl TicketTable {
 fn dedup_route_tickets(
     tickets: WorkerMatrix<Ticket>,
     mut payloads: Vec<Vec<Payload>>,
+    eid_arenas: Vec<EidArena>,
     links: &LinkTable,
     ncpu: usize,
     cfg: Config,
@@ -2183,6 +2236,7 @@ fn dedup_route_tickets(
     }
     let pay_ptrs: Vec<usize> = payloads.iter_mut().map(|v| v.as_mut_ptr() as usize).collect();
     let next_shard = AtomicUsize::new(0);
+    let eid_arenas_ref = &eid_arenas;
     thread::scope(|s| {
         for _ in 0..ncpu {
             s.spawn(|| {
@@ -2217,7 +2271,7 @@ fn dedup_route_tickets(
                         dup_bm.resize(words, 0);
                         for t in 0..ew {
                             for tk in unsafe { tickets.get_mut(t, sh) }.iter() {
-                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
+                                let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
                                 let (w, m) = (b >> 6, 1u64 << (b & 63));
                                 let sw = unsafe { seen_bm.get_unchecked_mut(w) };
                                 let hit = *sw & m;
@@ -2231,7 +2285,7 @@ fn dedup_route_tickets(
                         let raw = unsafe { tickets.get_mut(t, sh) };
                         for tk in raw.iter() {
                             if bm_on {
-                                let b = ((tk.event_id.hash64() >> 8) as usize) & bm_mask;
+                                let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
                                 if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
                                     continue;
                                 }
@@ -2246,7 +2300,7 @@ fn dedup_route_tickets(
                     table.reset(cand.len());
                     kept.clear();
                     for &(tk, t) in cand.iter() {
-                        if let Some(pos) = table.get_or_insert(tk.event_id, &kept) {
+                        if let Some(pos) = table.get_or_insert(tk.event_id, &kept, eid_arenas_ref) {
                             let cur = unsafe { kept.get_unchecked_mut(pos) };
                             if tk.ingest_s < cur.0.ingest_s {
                                 kill(cur.1, cur.0.loc);
@@ -2264,6 +2318,7 @@ fn dedup_route_tickets(
         }
     });
     drop(tickets);
+    drop(eid_arenas);
 
     const UNIT: usize = 1 << 16;
     let mut units: Vec<(usize, usize, usize)> = Vec::new();
@@ -2412,7 +2467,7 @@ fn main() -> io::Result<()> {
     let t2 = Instant::now();
     let pe_workers = match events_out {
         EventsOut::Legacy(ev) => dedup_route_legacy(ev, &links, ncpu, cfg),
-        EventsOut::Tickets(tk, pl) => dedup_route_tickets(tk, pl, &links, ncpu, cfg),
+        EventsOut::Tickets(tk, pl, ea) => dedup_route_tickets(tk, pl, ea, &links, ncpu, cfg),
     };
     let person_event_shards = WorkerMatrix::new(pe_workers);
     let ms_dedup = t2.elapsed().as_secs_f64() * 1000.0;

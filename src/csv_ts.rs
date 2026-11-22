@@ -8,7 +8,67 @@ const INTERNED_LEN_MASK: u64 = 0x7fff;
 const INTERNED_PTR_MASK: u64 = (1u64 << 47) - 1;
 const NUM_INTERN_SHARDS: usize = 256;
 const INTERN_ARENA_CHUNK: usize = 256 * 1024;
-const INTERN_CACHE_SLOTS: usize = 1024;
+const INTERN_CACHE_SLOTS: usize = 4096;
+
+pub const EID_ARENA_MAX_BYTES: usize = 1 << 28; // 256 MiB per worker; (off >> 2) fits in 26 bits
+
+/// Worker-local byte arena for non-inline (`>9` bytes or non-ASCII) `event_id`s.
+/// Eliminates global atomic interning and pointer chasing for `event_id`:
+/// a 33-bit hash, worker index (`0..15`), and 4-byte-aligned offset live inside `Key(u64)`.
+pub struct EidArena {
+    buf: Vec<u8>,
+}
+
+impl EidArena {
+    pub fn with_capacity(cap_bytes: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap_bytes.min(EID_ARENA_MAX_BYTES)),
+        }
+    }
+
+    #[inline(always)]
+    pub fn encode(&mut self, s: &[u8], worker_id: usize) -> Option<Key> {
+        let len = s.len();
+        if (1..=9).contains(&len) {
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            {
+                if let Some(k) = unsafe { Key::pack_bmi2(s) } {
+                    return Some(k);
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            {
+                if let Some(k) = Key::pack_scalar(s) {
+                    return Some(k);
+                }
+            }
+        }
+        self.encode_long(s, worker_id)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn encode_long(&mut self, s: &[u8], worker_id: usize) -> Option<Key> {
+        if worker_id >= 16 || s.len() > u16::MAX as usize {
+            return None;
+        }
+        let aligned = (self.buf.len() + 3) & !3;
+        let need = aligned.checked_add(2)?.checked_add(s.len())?;
+        if need > EID_ARENA_MAX_BYTES {
+            return None;
+        }
+        if aligned > self.buf.len() {
+            self.buf.resize(aligned, 0);
+        }
+        let h = hash_bytes(s);
+        let h33 = (h >> 31) & 0x1_FFFF_FFFF;
+        self.buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        self.buf.extend_from_slice(s);
+        Some(Key(
+            INTERNED_BIT | (h33 << 30) | ((worker_id as u64) << 26) | ((aligned as u64) >> 2),
+        ))
+    }
+}
 
 #[inline(always)]
 fn hash_word(h: u64, word: u64) -> u64 {
@@ -167,7 +227,7 @@ fn interners() -> &'static [Mutex<Interner>; NUM_INTERN_SHARDS] {
 
 // Input parsing is the only phase that creates IDs. Keep the common path entirely
 // lock-free; the legacy mutex tables remain as an exact overflow fallback.
-const FAST_INTERN_SLOTS: usize = 1 << 16;
+const FAST_INTERN_SLOTS: usize = 1 << 13;
 const FAST_INTERN_LIMIT: usize = FAST_INTERN_SLOTS * 3 / 4;
 
 #[derive(Clone, Copy, Default)]
@@ -177,9 +237,10 @@ struct FastEntry {
     len: usize,
 }
 
+#[repr(align(64))]
 struct FastInterner {
     slots: Vec<AtomicU64>,
-    entries: Box<[UnsafeCell<FastEntry>]>,
+    entries: Box<[UnsafeCell<std::mem::MaybeUninit<FastEntry>>]>,
     next: AtomicUsize,
     active: AtomicUsize,
     closed: AtomicBool,
@@ -191,12 +252,18 @@ unsafe impl Sync for FastInterner {}
 
 impl FastInterner {
     fn new() -> Self {
+        let layout = std::alloc::Layout::array::<AtomicU64>(FAST_INTERN_SLOTS).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut AtomicU64 };
+        assert!(!ptr.is_null());
+        let slots = unsafe { Vec::from_raw_parts(ptr, FAST_INTERN_SLOTS, FAST_INTERN_SLOTS) };
+        let mut entries_v: Vec<UnsafeCell<std::mem::MaybeUninit<FastEntry>>> =
+            Vec::with_capacity(FAST_INTERN_LIMIT);
+        unsafe {
+            entries_v.set_len(FAST_INTERN_LIMIT);
+        }
         Self {
-            slots: (0..FAST_INTERN_SLOTS).map(|_| AtomicU64::new(0)).collect(),
-            entries: (0..FAST_INTERN_LIMIT)
-                .map(|_| UnsafeCell::new(FastEntry::default()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            slots,
+            entries: entries_v.into_boxed_slice(),
             next: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -209,8 +276,13 @@ impl FastInterner {
     }
 
     #[inline(always)]
+    unsafe fn entry_ref(&self, idx: usize) -> &FastEntry {
+        unsafe { (&*self.entries[idx].get()).assume_init_ref() }
+    }
+
+    #[inline(always)]
     fn entry_bytes(&self, idx: usize) -> &'static [u8] {
-        let e = unsafe { &*self.entries[idx].get() };
+        let e = unsafe { self.entry_ref(idx) };
         unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) }
     }
 
@@ -225,7 +297,7 @@ impl FastInterner {
             }
             if (v >> 32) == tag {
                 let idx = (v as u32 - 1) as usize;
-                let e = unsafe { &*self.entries[idx].get() };
+                let e = unsafe { self.entry_ref(idx) };
                 if e.hash == hash && self.entry_bytes(idx) == s {
                     return Some(Key::encode_interned(sh, idx as u32, self.entry_bytes(idx)));
                 }
@@ -255,11 +327,11 @@ impl FastInterner {
 
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
         unsafe {
-            *self.entries[idx].get() = FastEntry {
+            (*self.entries[idx].get()).write(FastEntry {
                 hash,
                 ptr: stored.as_ptr() as usize,
                 len: stored.len(),
-            };
+            });
         }
         let wanted = (Self::tag(hash) << 32) | (idx as u64 + 1);
         let mask = self.slots.len() - 1;
@@ -275,7 +347,7 @@ impl FastInterner {
             }
             if (v >> 32) == Self::tag(hash) {
                 let other = (v as u32 - 1) as usize;
-                let e = unsafe { &*self.entries[other].get() };
+                let e = unsafe { self.entry_ref(other) };
                 if e.hash == hash && self.entry_bytes(other) == s {
                     break Key::encode_interned(sh, other as u32, self.entry_bytes(other));
                 }
@@ -344,17 +416,25 @@ impl Key {
         Self::from_bytes_impl(s, 1)
     }
 
-    /// Canonical identity like `from_bytes`, but optimistic for mostly unique
-    /// streams: probe for insertion directly instead of doing a lookup first.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     #[inline(always)]
-    pub fn from_bytes_unique(s: &[u8]) -> Self {
-        Self::from_bytes_impl(s, 2)
+    fn pack_scalar(s: &[u8]) -> Option<Self> {
+        let mut acc = 0u64;
+        let mut shift = 56i32;
+        for &b in s {
+            if b == 0 || b >= 0x80 {
+                return None;
+            }
+            acc |= (b as u64) << shift;
+            shift -= 7;
+        }
+        Some(Self(acc))
     }
 
     #[inline(always)]
     fn from_bytes_impl(s: &[u8], kind: u8) -> Self {
         let len = s.len();
-        if len >= 1 && len <= 9 {
+        if (1..=9).contains(&len) {
             #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
             {
                 if let Some(k) = unsafe { Self::pack_bmi2(s) } {
@@ -364,19 +444,10 @@ impl Key {
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             {
-                let mut acc = 0u64;
-                let mut shift = 56i32;
-                let mut i = 0usize;
-                while i < len {
-                    let b = s[i];
-                    if b == 0 || b >= 0x80 {
-                        return Self::id_slow(s, kind);
-                    }
-                    acc |= (b as u64) << shift;
-                    shift -= 7;
-                    i += 1;
+                if let Some(k) = Self::pack_scalar(s) {
+                    return k;
                 }
-                return Self(acc);
+                return Self::id_slow(s, kind);
             }
         }
         Self::id_slow(s, kind)
@@ -385,7 +456,7 @@ impl Key {
     #[inline(always)]
     fn id_slow(s: &[u8], kind: u8) -> Self {
         if kind != 1 {
-            return Self::intern_slow(s, hash_bytes(s), kind == 2);
+            return Self::intern_slow(s, hash_bytes(s));
         }
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
         let ptr = stored.as_ptr() as usize as u64;
@@ -393,7 +464,7 @@ impl Key {
         if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
             Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
         } else {
-            Self::intern_slow(s, hash_bytes(s), false)
+            Self::intern_slow(s, hash_bytes(s))
         }
     }
 
@@ -452,7 +523,7 @@ impl Key {
     }
 
     #[inline]
-    fn intern_slow(s: &[u8], hash: u64, insert_first: bool) -> Self {
+    fn intern_slow(s: &[u8], hash: u64) -> Self {
         let cache_slot = ((hash >> 24) as usize) & (INTERN_CACHE_SLOTS - 1);
         let cached = INTERN_CACHE.with(|cache| {
             let entry = cache.borrow()[cache_slot];
@@ -468,13 +539,8 @@ impl Key {
 
         let sh = ((hash >> 56) as usize) & (NUM_INTERN_SHARDS - 1);
         let fast = &fast_interners()[sh];
-        let key = if !insert_first {
-            if let Some(key) = fast.lookup(s, hash, sh) {
-                key
-            } else {
-                fast.intern(s, hash, sh)
-                    .unwrap_or_else(|| fast.fallback(s, hash, sh))
-            }
+        let key = if let Some(key) = fast.lookup(s, hash, sh) {
+            key
         } else {
             fast.intern(s, hash, sh)
                 .unwrap_or_else(|| fast.fallback(s, hash, sh))
@@ -548,6 +614,41 @@ impl Key {
         let x = self.0 ^ (self.0 >> 32);
         let r = (x as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (r as u64) ^ ((r >> 64) as u64)
+    }
+
+    #[inline(always)]
+    pub fn eid_hash64(self) -> u64 {
+        if (self.0 & INTERNED_BIT) == 0 {
+            self.hash64()
+        } else {
+            let h33 = (self.0 >> 30) & 0x1_FFFF_FFFF;
+            let x = h33 ^ (h33 >> 17);
+            let r = (x as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (r as u64) ^ ((r >> 64) as u64)
+        }
+    }
+
+    #[inline(always)]
+    pub fn eid_eq(self, other: Self, arenas: &[EidArena]) -> bool {
+        if (self.0 & other.0 & INTERNED_BIT) == 0 {
+            return self.0 == other.0;
+        }
+        if (self.0 >> 30) != (other.0 >> 30) {
+            return false;
+        }
+        if self.0 == other.0 {
+            return true;
+        }
+        unsafe { self.eid_slice(arenas) == other.eid_slice(arenas) }
+    }
+
+    #[inline(always)]
+    unsafe fn eid_slice<'a>(self, arenas: &'a [EidArena]) -> &'a [u8] {
+        let w = ((self.0 >> 26) & 0xF) as usize;
+        let off = ((self.0 & 0x03FF_FFFF) as usize) << 2;
+        let ptr = unsafe { arenas.get_unchecked(w).buf.as_ptr().add(off) };
+        let len = u16::from_le_bytes(unsafe { *(ptr as *const [u8; 2]) }) as usize;
+        unsafe { std::slice::from_raw_parts(ptr.add(2), len) }
     }
 
     #[inline]
@@ -1039,6 +1140,40 @@ impl DateCache {
             val
         };
         if d_ms == i64::MIN { None } else { Some(d_ms) }
+    }
+
+    #[inline(always)]
+    pub fn parse_ts_with_day(&mut self, s: &[u8]) -> Option<(i64, i64)> {
+        let len = s.len();
+        if len == 20 && s[19] == b'Z' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
+            let day_ms = self.cached_day_ms(s)?;
+            let hms_ms = parse_hms_swar(&s[11..19])?;
+            return Some((day_ms + hms_ms, day_ms));
+        }
+        let ts = self.parse_ts(s)?;
+        Some((ts, ts - ts.rem_euclid(86_400_000)))
+    }
+
+    #[inline(always)]
+    pub fn parse_ts_with_hint(&mut self, s: &[u8], hint_src: &[u8], hint_day_ms: i64) -> Option<i64> {
+        if s.len() == 20
+            && hint_src.len() == 20
+            && s[19] == b'Z'
+            && s[10] == b'T'
+            && s[13] == b':'
+            && s[16] == b':'
+        {
+            let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
+            let hk0 = u64::from_ne_bytes(hint_src[0..8].try_into().unwrap());
+            if k0 == hk0 {
+                let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
+                let hk1 = u16::from_ne_bytes(hint_src[8..10].try_into().unwrap());
+                if k1 == hk1 {
+                    return Some(hint_day_ms + parse_hms_swar(&s[11..19])?);
+                }
+            }
+        }
+        self.parse_ts(s)
     }
 
     #[inline(always)]
