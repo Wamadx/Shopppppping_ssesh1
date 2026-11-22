@@ -229,6 +229,9 @@ impl LinkTable {
 
     #[inline(always)]
     fn prefetch(&self, uid: Key) {
+        if uid == Key::EMPTY {
+            return;
+        }
         let h = uid.hash64();
         if self.use_bitfilter {
             let bit = (h as usize) & self.mask;
@@ -239,9 +242,12 @@ impl LinkTable {
     }
 
     /// Second prefetch stage: once the bitfilter word is cached (an earlier `prefetch`),
-    /// prefetch the map slot only for IDs the filter says are linked.
+    /// prefetch the map slot only for IDs the filter says are linked and not already cached.
     #[inline(always)]
-    fn prefetch_map(&self, uid: Key) {
+    fn prefetch_map_cached(&self, uid: Key, cache: &[(Key, Key); 1024]) {
+        if uid == Key::EMPTY {
+            return;
+        }
         let h = uid.hash64();
         if self.use_bitfilter {
             let bit = (h as usize) & self.mask;
@@ -249,6 +255,10 @@ impl LinkTable {
             if ((word >> (bit & 63)) & 1) == 0 {
                 return;
             }
+        }
+        let cidx = ((h >> 54) as usize) & 1023;
+        if unsafe { cache.get_unchecked(cidx).0 == uid } {
+            return;
         }
         self.map_for(h).prefetch_with_hash(h);
     }
@@ -403,34 +413,45 @@ impl DedupTable {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LocalPersonEntry {
+    key: u64,
+    id: u32,
+    stamp: u16,
+}
+
 struct LocalPersonMap {
-    entries: Vec<(u64, u32)>,
-    stamps: Vec<u16>,
-    epoch: u16,
+    entries: Vec<LocalPersonEntry>,
     mask: usize,
+    epoch: u16,
 }
 
 impl LocalPersonMap {
     fn new(initial_pow2: usize) -> Self {
         let cap = initial_pow2.next_power_of_two().max(1024);
         Self {
-            entries: vec![(0, 0); cap],
-            stamps: vec![0; cap],
-            epoch: 1,
+            entries: vec![
+                LocalPersonEntry { key: 0, id: 0, stamp: 0 };
+                cap
+            ],
             mask: cap - 1,
+            epoch: 1,
         }
     }
 
     fn reset(&mut self, needed: usize) {
-        let cap = (needed / 4).max(1024).next_power_of_two();
+        let cap = (needed / 12).max(1024).next_power_of_two();
         if cap > self.entries.len() {
-            self.entries.resize(cap, (0, 0));
-            self.stamps.resize(cap, 0);
+            self.entries.resize(
+                cap,
+                LocalPersonEntry { key: 0, id: 0, stamp: 0 },
+            );
         }
         self.mask = cap - 1;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            self.stamps.fill(0);
+            self.entries[..cap].fill(LocalPersonEntry { key: 0, id: 0, stamp: 0 });
             self.epoch = 1;
         }
     }
@@ -439,29 +460,28 @@ impl LocalPersonMap {
     fn grow(&mut self) {
         let old_cap = self.mask + 1;
         let new_cap = old_cap * 2;
-        let mut new_entries = vec![(0u64, 0u32); new_cap];
-        let mut new_stamps = vec![0u16; new_cap];
+        let mut new_entries = vec![
+            LocalPersonEntry { key: 0, id: 0, stamp: 0 };
+            new_cap
+        ];
         let new_mask = new_cap - 1;
         for i in 0..old_cap {
-            if self.stamps[i] == self.epoch {
-                let (k, id) = self.entries[i];
-                let mut idx = (Key(k).hash64() as usize) & new_mask;
-                while new_stamps[idx] == self.epoch {
+            let e = self.entries[i];
+            if e.stamp == self.epoch {
+                let mut idx = (Key(e.key).hash64() as usize) & new_mask;
+                while new_entries[idx].stamp == self.epoch {
                     idx = (idx + 1) & new_mask;
                 }
-                new_stamps[idx] = self.epoch;
-                new_entries[idx] = (k, id);
+                new_entries[idx] = e;
             }
         }
         self.entries = new_entries;
-        self.stamps = new_stamps;
         self.mask = new_mask;
     }
 
     #[inline(always)]
     fn prefetch(&self, key: Key) {
         let idx = (key.hash64() as usize) & self.mask;
-        prefetch_ro(self.stamps.as_ptr().wrapping_add(idx));
         prefetch_ro(self.entries.as_ptr().wrapping_add(idx));
     }
 
@@ -470,21 +490,22 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
+            let ep = unsafe { self.entries.get_unchecked_mut(idx) };
+            if ep.stamp != self.epoch {
                 let id = *next_id;
                 *next_id = id + 1;
-                unsafe {
-                    *self.stamps.get_unchecked_mut(idx) = self.epoch;
-                    *self.entries.get_unchecked_mut(idx) = (k, id);
-                }
-                if ((*next_id as usize) * 2) >= self.mask + 1 {
+                *ep = LocalPersonEntry {
+                    key: k,
+                    id,
+                    stamp: self.epoch,
+                };
+                if ((*next_id as usize) * 4) >= (self.mask + 1) * 3 {
                     self.grow();
                 }
                 return (id, true);
             }
-            let e = unsafe { *self.entries.get_unchecked(idx) };
-            if e.0 == k {
-                return (e.1, false);
+            if ep.key == k {
+                return (ep.id, false);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -495,12 +516,12 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
+            let ep = unsafe { *self.entries.get_unchecked(idx) };
+            if ep.stamp != self.epoch {
                 return None;
             }
-            let e = unsafe { *self.entries.get_unchecked(idx) };
-            if e.0 == k {
-                return Some(e.1);
+            if ep.key == k {
+                return Some(ep.id);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -874,6 +895,13 @@ struct SharedBuf<T>(UnsafeCell<Vec<T>>);
 unsafe impl<T: Send> Sync for SharedBuf<T> {}
 
 #[inline(always)]
+unsafe fn uninit_vec<T>(len: usize) -> Vec<T> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
+#[inline(always)]
 fn range_of(n: usize, t: usize, tid: usize) -> (usize, usize) {
     (n * tid / t, n * (tid + 1) / t)
 }
@@ -976,8 +1004,8 @@ fn rank_recs(recs: &[EndRec], ncpu: usize) -> (Vec<u64>, Vec<u32>) {
         offs[tid] = total;
         total += counts[tid];
     }
-    let ubuf = SharedBuf(UnsafeCell::new(vec![0u64; total]));
-    let hbuf = SharedBuf(UnsafeCell::new(vec![0u32; n]));
+    let ubuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u64>(total) }));
+    let hbuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u32>(n) }));
     thread::scope(|s| {
         for tid in 0..t {
             let (lo, hi) = range_of(n, t, tid);
@@ -1094,11 +1122,33 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     let p = u.partition_point(|&k| (k & IB) == 0);
     // Carry each interned key's ORIGINAL rank (p + position in the u64-sorted
     // suffix) through the byte sort; the merge must remap that original rank.
-    let mut long: Vec<LongOrderRec> = u[p..]
-        .iter()
-        .enumerate()
-        .map(|(idx, &k)| LongOrderRec::new(Key(k), p + idx))
-        .collect();
+    let ln = n - p;
+    let mut long = unsafe { uninit_vec::<LongOrderRec>(ln) };
+    let lt = ncpu.min((ln / 16384).max(1));
+    if lt == 1 {
+        for (idx, &k) in u[p..].iter().enumerate() {
+            long[idx] = LongOrderRec::new(Key(k), p + idx);
+        }
+    } else {
+        let lbuf = SharedBuf(UnsafeCell::new(long));
+        let us = &u[p..];
+        thread::scope(|s| {
+            for tid in 0..lt {
+                let (lo, hi) = range_of(ln, lt, tid);
+                let lb = &lbuf;
+                s.spawn(move || {
+                    let lw = unsafe { &mut *lb.0.get() };
+                    for idx in lo..hi {
+                        unsafe {
+                            *lw.get_unchecked_mut(idx) =
+                                LongOrderRec::new(Key(*us.get_unchecked(idx)), p + idx);
+                        }
+                    }
+                });
+            }
+        });
+        long = lbuf.0.into_inner();
+    }
     radix_sort_long_order(&mut long);
     let mut nu = vec![0u64; n];
     let mut remap = vec![0u32; n];
@@ -1316,8 +1366,13 @@ fn load_links_sort(
         let mut handles = Vec::with_capacity(ncpu.min(chunks.len()).max(1));
         for _ in 0..ncpu.min(chunks.len()).max(1) {
             handles.push(s.spawn(|| {
-                let mut local_pairs = Vec::new();
+                let mut local_pairs: Vec<(Key, Key)> = Vec::new();
                 let mut buf = Vec::new();
+                const HEX_RING: usize = 16;
+                let mut ring: [(usize, u8, csv_ts::HexProbe, *const u8); HEX_RING] =
+                    [(0, 0, csv_ts::HexProbe::default(), std::ptr::null()); HEX_RING];
+                let mut ring_n = 0usize;
+                let mut ring_head = 0usize;
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     if cidx >= chunks.len() {
@@ -1329,9 +1384,65 @@ fn load_links_sort(
                             .expect("failed to read link chunk");
                     for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
                         if !a.is_empty() && !b.is_empty() && a != b {
-                            local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
+                            let pidx = local_pairs.len();
+                            let ka = if let Some(pr) = csv_ts::hex_user_probe(a) {
+                                if ring_n == HEX_RING {
+                                    let (idx, side, ref op, optr) = ring[ring_head];
+                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                                    let k = csv_ts::hex_user_resolve(op, os);
+                                    let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
+                                    if side == 0 {
+                                        slot.0 = k;
+                                    } else {
+                                        slot.1 = k;
+                                    }
+                                    ring_head = (ring_head + 1) % HEX_RING;
+                                    ring_n -= 1;
+                                }
+                                let rslot = (ring_head + ring_n) % HEX_RING;
+                                ring[rslot] = (pidx, 0, pr, a.as_ptr());
+                                ring_n += 1;
+                                Key::EMPTY
+                            } else {
+                                Key::from_bytes(a)
+                            };
+                            let kb = if let Some(pr) = csv_ts::hex_user_probe(b) {
+                                if ring_n == HEX_RING {
+                                    let (idx, side, ref op, optr) = ring[ring_head];
+                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                                    let k = csv_ts::hex_user_resolve(op, os);
+                                    let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
+                                    if side == 0 {
+                                        slot.0 = k;
+                                    } else {
+                                        slot.1 = k;
+                                    }
+                                    ring_head = (ring_head + 1) % HEX_RING;
+                                    ring_n -= 1;
+                                }
+                                let rslot = (ring_head + ring_n) % HEX_RING;
+                                ring[rslot] = (pidx, 1, pr, b.as_ptr());
+                                ring_n += 1;
+                                Key::EMPTY
+                            } else {
+                                Key::from_bytes(b)
+                            };
+                            local_pairs.push((ka, kb));
                         }
                     });
+                    while ring_n > 0 {
+                        let (idx, side, ref op, optr) = ring[ring_head];
+                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                        let k = csv_ts::hex_user_resolve(op, os);
+                        let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
+                        if side == 0 {
+                            slot.0 = k;
+                        } else {
+                            slot.1 = k;
+                        }
+                        ring_head = (ring_head + 1) % HEX_RING;
+                        ring_n -= 1;
+                    }
                 }
                 local_pairs
             }));
@@ -1355,9 +1466,8 @@ fn load_links_sort(
         acc += pv.len();
     }
     woff.push(acc);
-    let zero = EndRec { key: 0, refr: 0 };
-    let recs = SharedBuf(UnsafeCell::new(vec![zero; 2 * e]));
-    let mut scratch = vec![zero; 2 * e];
+    let recs = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<EndRec>(2 * e) }));
+    let mut scratch = unsafe { uninit_vec::<EndRec>(2 * e) };
     thread::scope(|s| {
         let mut hs = Vec::with_capacity(pairs_per_worker.len());
         for (w, pv) in pairs_per_worker.iter().enumerate() {
@@ -1684,7 +1794,7 @@ fn read_clicks_parallel(
         return Ok(WorkerMatrix::new(Vec::new()));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
+    let per_click_shard_cap = ((total_bytes / 48) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<PersonClick>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
@@ -1697,9 +1807,13 @@ fn read_clicks_parallel(
                 let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                 let mut buf = Vec::new();
                 let mut chunk_clks: Vec<(Key, Key, u32, u32)> = Vec::with_capacity(8192);
-                // Long hex user IDs: probed (slot prefetched) while parsing, resolved after
-                // the chunk is parsed and before its buffer can be reused.
-                let mut hex_pending: Vec<(u32, csv_ts::HexProbe, *const u8)> = Vec::with_capacity(2048);
+                // Long hex user IDs: probed (slot prefetched) while parsing and resolved
+                // HEX_RING rows later so the prefetched line stays hot in L1d.
+                const HEX_RING: usize = 16;
+                let mut ring: [(u32, csv_ts::HexProbe, *const u8); HEX_RING] =
+                    [(0, csv_ts::HexProbe::default(), std::ptr::null()); HEX_RING];
+                let mut ring_n = 0usize;
+                let mut ring_head = 0usize;
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     if cidx >= chunks.len() {
@@ -1728,8 +1842,19 @@ fn read_clicks_parallel(
                             if ts < base_ts || ts >= window_end {
                                 return;
                             }
+                            let cslot = chunk_clks.len() as u32;
                             let raw_uid = if let Some(pr) = csv_ts::hex_user_probe(uid) {
-                                hex_pending.push((chunk_clks.len() as u32, pr, uid.as_ptr()));
+                                if ring_n == HEX_RING {
+                                    let (idx, ref op, optr) = ring[ring_head];
+                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                                    unsafe { chunk_clks.get_unchecked_mut(idx as usize) }.0 =
+                                        csv_ts::hex_user_resolve(op, os);
+                                    ring_head = (ring_head + 1) % HEX_RING;
+                                    ring_n -= 1;
+                                }
+                                let rslot = (ring_head + ring_n) % HEX_RING;
+                                ring[rslot] = (cslot, pr, uid.as_ptr());
+                                ring_n += 1;
                                 Key::EMPTY
                             } else {
                                 Key::from_bytes(uid)
@@ -1743,19 +1868,24 @@ fn read_clicks_parallel(
                             ));
                         },
                     );
-                    for &(idx, ref pr, ptr) in hex_pending.iter() {
-                        let s = unsafe { std::slice::from_raw_parts(ptr, 33) };
+                    while ring_n > 0 {
+                        let (idx, ref op, optr) = ring[ring_head];
+                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
                         unsafe { chunk_clks.get_unchecked_mut(idx as usize) }.0 =
-                            csv_ts::hex_user_resolve(pr, s);
+                            csv_ts::hex_user_resolve(op, os);
+                        ring_head = (ring_head + 1) % HEX_RING;
+                        ring_n -= 1;
                     }
-                    hex_pending.clear();
                     let n = chunk_clks.len();
                     for i in 0..n {
                         if i + 32 < n {
                             links.prefetch(unsafe { chunk_clks.get_unchecked(i + 32) }.0);
                         }
                         if i + 16 < n {
-                            links.prefetch_map(unsafe { chunk_clks.get_unchecked(i + 16) }.0);
+                            links.prefetch_map_cached(
+                                unsafe { chunk_clks.get_unchecked(i + 16) }.0,
+                                &link_cache,
+                            );
                         }
                         let (raw_uid, click_id, ts_rel, campaign_idx) =
                             unsafe { *chunk_clks.get_unchecked(i) };
@@ -1775,6 +1905,28 @@ fn read_clicks_parallel(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     Ok(WorkerMatrix::new(workers))
+}
+
+#[inline]
+fn insertion_sort_clicks(arr: &mut [CompactClick]) {
+    for i in 1..arr.len() {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0 {
+            let prev = arr[j - 1];
+            let gt = if key.ts_rel != prev.ts_rel {
+                key.ts_rel < prev.ts_rel
+            } else {
+                key.click_id.cmp_bytes(&prev.click_id) == std::cmp::Ordering::Greater
+            };
+            if !gt {
+                break;
+            }
+            arr[j] = prev;
+            j -= 1;
+        }
+        arr[j] = key;
+    }
 }
 
 #[inline]
@@ -1914,7 +2066,7 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
             .map(|sh| event_shards.shard_len(sh))
             .sum()
     };
-    let per_person_shard_cap = (total_raw_events / (ncpu * NUM_PERSON_SHARDS)).max(64);
+    let per_person_shard_cap = ((total_raw_events * 17 / 16) / (ncpu * NUM_PERSON_SHARDS)).max(64);
     let next_shard = AtomicUsize::new(0);
     let pe_workers: Vec<Vec<Vec<PersonEvent>>> = if ew == 0 {
         Vec::new()
@@ -1930,8 +2082,7 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
                         .collect();
                     let mut link_cache = [(Key::EMPTY, Key::EMPTY); 1024];
                     let mut pwc: WcSink<PersonEvent, 4> = WcSink::new(NUM_PERSON_SHARDS, cfg.use_wc);
-                    let mut seen_bm: Vec<u64> = Vec::new();
-                    let mut dup_bm: Vec<u64> = Vec::new();
+                    let mut bm: Vec<(u64, u64)> = Vec::new();
 
                     loop {
                         let sh = next_shard.fetch_add(1, Ordering::Relaxed);
@@ -1956,19 +2107,17 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
                         let bm_mask = bm_bits.wrapping_sub(1);
                         if bm_on {
                             let words = bm_bits / 64;
-                            seen_bm.clear();
-                            seen_bm.resize(words, 0);
-                            dup_bm.clear();
-                            dup_bm.resize(words, 0);
+                            bm.clear();
+                            bm.resize(words, (0, 0));
                             for t in 0..ew {
                                 let raw = unsafe { event_shards.get_mut(t, sh) };
                                 for ev in raw.iter() {
                                     let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
                                     let (w, m) = (b >> 6, 1u64 << (b & 63));
-                                    let sw = unsafe { seen_bm.get_unchecked_mut(w) };
-                                    let hit = *sw & m;
-                                    *sw |= m;
-                                    unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                                    let slot = unsafe { bm.get_unchecked_mut(w) };
+                                    let hit = slot.0 & m;
+                                    slot.0 |= m;
+                                    slot.1 |= hit;
                                 }
                             }
                         }
@@ -1983,7 +2132,7 @@ fn dedup_route_legacy(event_shards: WorkerMatrix<RawEvent>, links: &LinkTable, n
                                 let ev = raw[i];
                                 if bm_on {
                                     let b = ((ev.event_id.hash64() >> 8) as usize) & bm_mask;
-                                    if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
+                                    if unsafe { bm.get_unchecked(b >> 6).1 } & (1u64 << (b & 63)) == 0 {
                                         if ev.ts_rel != u32::MAX {
                                             if i + 16 < rlen && raw[i + 16].ts_rel != u32::MAX {
                                                 links.prefetch(raw[i + 16].user_id);
@@ -2107,10 +2256,10 @@ fn read_events_tickets(
         return Ok(Some((WorkerMatrix::new(Vec::new()), Vec::new(), Vec::new())));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    // >= 2048 tickets (32 KiB) keeps every shard Vec on the huge-page slab allocator, not musl malloc.
-    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(2048);
-    let per_worker_payload_cap = ((total_bytes / 52) as usize / ncpu).max(1024);
-    let eid_arena_cap = ((total_bytes / 56) as usize / ncpu / 7).max(4096) * 36;
+    let per_shard_cap = ((total_bytes / 70) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(64);
+    let per_worker_payload_cap = ((total_bytes / 74) as usize / ncpu).max(1024);
+    let eid_arena_cap = ((total_bytes / 180) as usize / ncpu).max(64 * 1024);
+    let eid_hex_cap = ((total_bytes / 80) as usize / ncpu / 7).max(4096);
     let ingest_base_s = base_ts.div_euclid(1000) - (1i64 << 31);
     let loc_max = cfg.ticket_loc_max as usize;
     let bail = AtomicBool::new(false);
@@ -2127,7 +2276,7 @@ fn read_events_tickets(
                     .map(|_| Vec::with_capacity(per_shard_cap))
                     .collect();
                 let mut payloads: Vec<Payload> = Vec::with_capacity(per_worker_payload_cap);
-                let mut eid_arena = EidArena::with_capacity(eid_arena_cap);
+                let mut eid_arena = EidArena::with_capacity(eid_arena_cap, eid_hex_cap);
                 let mut wc: WcSink<Ticket, 4> = WcSink::new(NUM_DEDUP_SHARDS, cfg.use_wc);
                 let mut dc_ing = DateCache::new();
                 let mut dc_ts = DateCache::new();
@@ -2165,8 +2314,14 @@ fn read_events_tickets(
                             else {
                                 return;
                             };
-                            let ing_rel = ingest_ts.div_euclid(1000) - ingest_base_s;
-                            if ingest_ts.rem_euclid(1000) != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
+                            let (ing_sec, ing_rem) = if ingest_ts >= 0 {
+                                let u = ingest_ts as u64;
+                                ((u / 1000) as i64, (u % 1000) as i64)
+                            } else {
+                                (ingest_ts.div_euclid(1000), ingest_ts.rem_euclid(1000))
+                            };
+                            let ing_rel = ing_sec - ingest_base_s;
+                            if ing_rem != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
                                 bad = true;
                                 return;
                             }
@@ -2355,8 +2510,7 @@ fn dedup_route_tickets(
                 let mut table = TicketTable::new();
                 let mut cand: Vec<(Ticket, u32)> = Vec::new();
                 let mut kept: Vec<(Ticket, u32)> = Vec::new();
-                let mut seen_bm: Vec<u64> = Vec::new();
-                let mut dup_bm: Vec<u64> = Vec::new();
+                let mut bm: Vec<(u64, u64)> = Vec::new();
                 // Each payload has exactly one ticket, so no element is ever written by two threads.
                 let kill = |t: u32, loc: u32| {
                     if loc != LOC_NONE {
@@ -2377,18 +2531,16 @@ fn dedup_route_tickets(
                     let bm_mask = bm_bits.wrapping_sub(1);
                     if bm_on {
                         let words = bm_bits / 64;
-                        seen_bm.clear();
-                        seen_bm.resize(words, 0);
-                        dup_bm.clear();
-                        dup_bm.resize(words, 0);
+                        bm.clear();
+                        bm.resize(words, (0, 0));
                         for t in 0..ew {
                             for tk in unsafe { tickets.get_mut(t, sh) }.iter() {
                                 let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
                                 let (w, m) = (b >> 6, 1u64 << (b & 63));
-                                let sw = unsafe { seen_bm.get_unchecked_mut(w) };
-                                let hit = *sw & m;
-                                *sw |= m;
-                                unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                                let slot = unsafe { bm.get_unchecked_mut(w) };
+                                let hit = slot.0 & m;
+                                slot.0 |= m;
+                                slot.1 |= hit;
                             }
                         }
                     }
@@ -2398,7 +2550,7 @@ fn dedup_route_tickets(
                         for tk in raw.iter() {
                             if bm_on {
                                 let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
-                                if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
+                                if unsafe { bm.get_unchecked(b >> 6).1 } & (1u64 << (b & 63)) == 0 {
                                     continue;
                                 }
                             }
@@ -2444,7 +2596,7 @@ fn dedup_route_tickets(
             st = en;
         }
     }
-    let per_person_shard_cap = (total_payloads / (ncpu * NUM_PERSON_SHARDS)).max(64);
+    let per_person_shard_cap = ((total_payloads * 17 / 16) / (ncpu * NUM_PERSON_SHARDS)).max(64);
     let next_unit = AtomicUsize::new(0);
     let payloads_ref = &payloads;
     let units_ref = &units;
@@ -2470,7 +2622,10 @@ fn dedup_route_tickets(
                             links.prefetch(unsafe { sl.get_unchecked(i + 32) }.user_id);
                         }
                         if i + 16 < n {
-                            links.prefetch_map(unsafe { sl.get_unchecked(i + 16) }.user_id);
+                            links.prefetch_map_cached(
+                                unsafe { sl.get_unchecked(i + 16) }.user_id,
+                                &link_cache,
+                            );
                         }
                         let p = unsafe { *sl.get_unchecked(i) };
                         if p.user_id == Key::EMPTY {
@@ -2514,15 +2669,21 @@ fn main() -> io::Result<()> {
 
     let (window_start, window_end) = parse_manifest(&data_dir.join("manifest.json"))?;
     {
-        let mut bytes = 0u64;
-        for sub in ["events", "clicks", "links"] {
+        let mut ev_clk_bytes = 0u64;
+        for sub in ["events", "clicks"] {
             if let Ok(rd) = std::fs::read_dir(data_dir.join(sub)) {
                 for e in rd.flatten() {
-                    bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    ev_clk_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
                 }
             }
         }
-        csv_ts::size_hex_table(bytes);
+        let mut links_bytes = 0u64;
+        if let Ok(rd) = std::fs::read_dir(data_dir.join("links")) {
+            for e in rd.flatten() {
+                links_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        csv_ts::size_hex_table(ev_clk_bytes, links_bytes);
     }
     let base_ts = window_start - SEVEN_DAYS_MS;
     assert!((window_end - base_ts) < (u32::MAX as i64));
@@ -2660,7 +2821,7 @@ fn main() -> io::Result<()> {
                 let mut sorted_evs: Vec<u64> = Vec::new();
 
                 let mut clk_counts: Vec<u32> = Vec::new();
-                let mut clk_tmp: Vec<(u32, CompactClick)> = Vec::new();
+                let mut clk_lpids: Vec<u32> = Vec::new();
                 let mut clk_offs: Vec<u32> = Vec::new();
                 let mut sorted_clks: Vec<CompactClick> = Vec::new();
 
@@ -2721,7 +2882,9 @@ fn main() -> io::Result<()> {
                         }
                         bin_offs[num_bins] = bacc;
 
-                        bin_buf.resize(total_evs, (0, 0));
+                        bin_buf.clear();
+                        bin_buf.reserve(total_evs);
+                        unsafe { bin_buf.set_len(total_evs) };
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2747,7 +2910,9 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        unsafe { sorted_evs.set_len(total_evs) };
                         for &(lpid, packed_ev) in &bin_buf[..total_evs] {
                             let dst = ev_counts[lpid as usize] as usize;
                             ev_counts[lpid as usize] = (dst + 1) as u32;
@@ -2784,7 +2949,9 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        unsafe { sorted_evs.set_len(total_evs) };
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2804,7 +2971,13 @@ fn main() -> io::Result<()> {
                     // Filter and counting-sort clicks strictly for people with surviving events
                     clk_counts.clear();
                     clk_counts.resize(num_people, 0);
-                    clk_tmp.clear();
+                    let total_clks: usize =
+                        (0..pcw).map(|t| unsafe { pc_ref.get_mut(t, sh) }.len()).sum();
+                    clk_lpids.clear();
+                    clk_lpids.reserve(total_clks);
+                    unsafe { clk_lpids.set_len(total_clks) };
+                    let mut k = 0usize;
+                    let mut valid_clks = 0usize;
                     for t in 0..pcw {
                         let clks = unsafe { pc_ref.get_mut(t, sh) };
                         let clen = clks.len();
@@ -2812,20 +2985,22 @@ fn main() -> io::Result<()> {
                             if cfg.use_prefetch && i + 16 < clen {
                                 pmap.prefetch(clks[i + 16].person_id);
                             }
-                            let clk = &clks[i];
-                            if let Some(lpid) = pmap.get(clk.person_id) {
-                                clk_counts[lpid as usize] += 1;
-                                clk_tmp.push((
-                                    lpid,
-                                    CompactClick {
-                                        ts_rel: clk.ts_rel,
-                                        campaign_idx: clk.campaign_idx,
-                                        click_id: clk.click_id,
-                                    },
-                                ));
-                            }
+                            let pid = clks[i].person_id;
+                            let lpid = if pid == Key::EMPTY {
+                                u32::MAX
+                            } else {
+                                match pmap.get(pid) {
+                                    Some(id) => {
+                                        clk_counts[id as usize] += 1;
+                                        valid_clks += 1;
+                                        id
+                                    }
+                                    None => u32::MAX,
+                                }
+                            };
+                            unsafe { *clk_lpids.get_unchecked_mut(k) = lpid };
+                            k += 1;
                         }
-                        *clks = Vec::new();
                     }
 
                     clk_offs.resize(num_people + 1, 0);
@@ -2837,18 +3012,28 @@ fn main() -> io::Result<()> {
                     }
                     clk_offs[num_people] = cacc;
 
-                    sorted_clks.resize(
-                        clk_tmp.len(),
-                        CompactClick {
-                            ts_rel: 0,
-                            campaign_idx: 0,
-                            click_id: Key::EMPTY,
-                        },
-                    );
-                    for &(lpid, cc) in &clk_tmp {
-                        let dst = clk_counts[lpid as usize] as usize;
-                        clk_counts[lpid as usize] = (dst + 1) as u32;
-                        sorted_clks[dst] = cc;
+                    sorted_clks.clear();
+                    sorted_clks.reserve(valid_clks);
+                    unsafe { sorted_clks.set_len(valid_clks) };
+                    let mut k = 0usize;
+                    for t in 0..pcw {
+                        let clks = unsafe { pc_ref.get_mut(t, sh) };
+                        for clk in clks.iter() {
+                            let lpid = unsafe { *clk_lpids.get_unchecked(k) };
+                            k += 1;
+                            if lpid != u32::MAX {
+                                let dst = clk_counts[lpid as usize] as usize;
+                                clk_counts[lpid as usize] = (dst + 1) as u32;
+                                unsafe {
+                                    *sorted_clks.get_unchecked_mut(dst) = CompactClick {
+                                        ts_rel: clk.ts_rel,
+                                        campaign_idx: clk.campaign_idx,
+                                        click_id: clk.click_id,
+                                    };
+                                }
+                            }
+                        }
+                        *clks = Vec::new();
                     }
 
                     for p in 0..num_people {
@@ -2856,7 +3041,11 @@ fn main() -> io::Result<()> {
                         let pevs = &mut sorted_evs[ev_offs[p] as usize..ev_offs[p + 1] as usize];
                         let pclks =
                             &mut sorted_clks[clk_offs[p] as usize..clk_offs[p + 1] as usize];
-                        if pclks.len() > 1 {
+                        if pclks.len() <= 16 {
+                            if pclks.len() > 1 {
+                                insertion_sort_clicks(pclks);
+                            }
+                        } else {
                             pclks.sort_unstable_by(|a, b| {
                                 a.ts_rel
                                     .cmp(&b.ts_rel)

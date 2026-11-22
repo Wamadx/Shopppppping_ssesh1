@@ -26,17 +26,23 @@ impl Compressor {
         let n = src.len();
         dst.reserve(Self::max_len(n));
         put_varint(dst, n as u64);
-        if n < 8 {
+        if n < 32 {
             emit_literal(dst, src);
             return;
         }
-        self.table.fill(0);
+        let mut htsize = 256usize;
+        let max_htsize = 1usize << HASH_BITS;
+        while htsize < max_htsize && htsize < n {
+            htsize <<= 1;
+        }
+        self.table[..htsize].fill(0);
+        let shift = 32 - htsize.trailing_zeros();
         let limit = n - 4; // last position where a 4-byte load is in bounds
         let mut next_emit = 0usize;
         let mut i = 0usize;
         while i <= limit {
             let cur = load32(src, i);
-            let h = hash(cur);
+            let h = hash(cur, shift);
             let cand = self.table[h] as usize;
             self.table[h] = (i + 1) as u32;
             if cand != 0 {
@@ -66,8 +72,8 @@ fn load32(s: &[u8], i: usize) -> u32 {
 }
 
 #[inline(always)]
-fn hash(v: u32) -> usize {
-    (v.wrapping_mul(0x1E35_A7BD) >> (32 - HASH_BITS)) as usize
+fn hash(v: u32, shift: u32) -> usize {
+    (v.wrapping_mul(0x1E35_A7BD) >> shift) as usize
 }
 
 fn put_varint(dst: &mut Vec<u8>, mut v: u64) {
