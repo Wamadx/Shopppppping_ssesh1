@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const INTERNED_BIT: u64 = 1u64 << 63;
@@ -46,6 +47,16 @@ struct InternArena {
     // initialized bytes. Moving the Vec never moves the allocation itself.
     chunks: Vec<Vec<u8>>,
     offset: usize,
+}
+
+impl Drop for InternArena {
+    fn drop(&mut self) {
+        // Keys can outlive the worker that allocated their bytes (notably the
+        // links workers), so thread-local arenas are intentionally leaked.
+        for chunk in self.chunks.drain(..) {
+            std::mem::forget(chunk);
+        }
+    }
 }
 
 impl InternArena {
@@ -152,6 +163,146 @@ static INTERNERS: OnceLock<[Mutex<Interner>; NUM_INTERN_SHARDS]> = OnceLock::new
 
 fn interners() -> &'static [Mutex<Interner>; NUM_INTERN_SHARDS] {
     INTERNERS.get_or_init(|| std::array::from_fn(|_| Mutex::new(Interner::default())))
+}
+
+// Input parsing is the only phase that creates IDs. Keep the common path entirely
+// lock-free; the legacy mutex tables remain as an exact overflow fallback.
+const FAST_INTERN_SLOTS: usize = 1 << 16;
+const FAST_INTERN_LIMIT: usize = FAST_INTERN_SLOTS * 3 / 4;
+
+#[derive(Clone, Copy, Default)]
+struct FastEntry {
+    hash: u64,
+    ptr: usize,
+    len: usize,
+}
+
+struct FastInterner {
+    slots: Vec<AtomicU64>,
+    entries: Box<[UnsafeCell<FastEntry>]>,
+    next: AtomicUsize,
+    active: AtomicUsize,
+    closed: AtomicBool,
+}
+
+// Each entry index has one writer. Its contents are fully initialized before a
+// release CAS publishes the corresponding slot; readers acquire that slot.
+unsafe impl Sync for FastInterner {}
+
+impl FastInterner {
+    fn new() -> Self {
+        Self {
+            slots: (0..FAST_INTERN_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            entries: (0..FAST_INTERN_LIMIT)
+                .map(|_| UnsafeCell::new(FastEntry::default()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            next: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    #[inline(always)]
+    fn tag(hash: u64) -> u64 {
+        hash >> 32
+    }
+
+    #[inline(always)]
+    fn entry_bytes(&self, idx: usize) -> &'static [u8] {
+        let e = unsafe { &*self.entries[idx].get() };
+        unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) }
+    }
+
+    fn lookup(&self, s: &[u8], hash: u64, sh: usize) -> Option<Key> {
+        let mask = self.slots.len() - 1;
+        let mut pos = (hash as usize) & mask;
+        let tag = Self::tag(hash);
+        loop {
+            let v = self.slots[pos].load(Ordering::Acquire);
+            if v == 0 {
+                return None;
+            }
+            if (v >> 32) == tag {
+                let idx = (v as u32 - 1) as usize;
+                let e = unsafe { &*self.entries[idx].get() };
+                if e.hash == hash && self.entry_bytes(idx) == s {
+                    return Some(Key::encode_interned(sh, idx as u32, self.entry_bytes(idx)));
+                }
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    // None means that this shard closed at its load limit. The caller drains
+    // active inserts before crossing to the legacy table so the two tables can
+    // never return different canonical keys for the same bytes.
+    fn intern(&self, s: &[u8], hash: u64, sh: usize) -> Option<Key> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::Acquire);
+        if self.closed.load(Ordering::Acquire) {
+            self.active.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed);
+        if idx >= FAST_INTERN_LIMIT {
+            self.closed.store(true, Ordering::Release);
+            self.active.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+
+        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
+        unsafe {
+            *self.entries[idx].get() = FastEntry {
+                hash,
+                ptr: stored.as_ptr() as usize,
+                len: stored.len(),
+            };
+        }
+        let wanted = (Self::tag(hash) << 32) | (idx as u64 + 1);
+        let mask = self.slots.len() - 1;
+        let mut pos = (hash as usize) & mask;
+        let key = loop {
+            let slot = &self.slots[pos];
+            let mut v = slot.load(Ordering::Acquire);
+            if v == 0 {
+                match slot.compare_exchange_weak(0, wanted, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break Key::encode_interned(sh, idx as u32, stored),
+                    Err(actual) => v = actual,
+                }
+            }
+            if (v >> 32) == Self::tag(hash) {
+                let other = (v as u32 - 1) as usize;
+                let e = unsafe { &*self.entries[other].get() };
+                if e.hash == hash && self.entry_bytes(other) == s {
+                    break Key::encode_interned(sh, other as u32, self.entry_bytes(other));
+                }
+            }
+            pos = (pos + 1) & mask;
+        };
+        self.active.fetch_sub(1, Ordering::Release);
+        Some(key)
+    }
+
+    fn fallback(&self, s: &[u8], hash: u64, sh: usize) -> Key {
+        while self.active.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+        self.lookup(s, hash, sh)
+            .unwrap_or_else(|| interners()[sh].lock().unwrap().intern(s, hash, sh))
+    }
+}
+
+static FAST_INTERNERS: OnceLock<[FastInterner; NUM_INTERN_SHARDS]> = OnceLock::new();
+
+fn fast_interners() -> &'static [FastInterner; NUM_INTERN_SHARDS] {
+    FAST_INTERNERS.get_or_init(|| std::array::from_fn(|_| FastInterner::new()))
+}
+
+thread_local! {
+    static INTERN_ARENA: RefCell<InternArena> = const { RefCell::new(InternArena { chunks: Vec::new(), offset: 0 }) };
 }
 
 #[derive(Clone, Copy)]
@@ -282,7 +433,13 @@ impl Key {
         }
 
         let sh = ((hash >> 56) as usize) & (NUM_INTERN_SHARDS - 1);
-        let key = interners()[sh].lock().unwrap().intern(s, hash, sh);
+        let fast = &fast_interners()[sh];
+        let key = if let Some(key) = fast.lookup(s, hash, sh) {
+            key
+        } else {
+            fast.intern(s, hash, sh)
+                .unwrap_or_else(|| fast.fallback(s, hash, sh))
+        };
         INTERN_CACHE.with(|cache| {
             cache.borrow_mut()[cache_slot] = InternCacheEntry { hash, key };
         });
