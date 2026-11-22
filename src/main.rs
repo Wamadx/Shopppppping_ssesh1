@@ -2446,6 +2446,17 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| thread::available_parallelism().map_or(4, usize::from));
 
     let (window_start, window_end) = parse_manifest(&data_dir.join("manifest.json"))?;
+    {
+        let mut bytes = 0u64;
+        for sub in ["events", "clicks", "links"] {
+            if let Ok(rd) = std::fs::read_dir(data_dir.join(sub)) {
+                for e in rd.flatten() {
+                    bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        csv_ts::size_hex_table(bytes);
+    }
     let base_ts = window_start - SEVEN_DAYS_MS;
     assert!((window_end - base_ts) < (u32::MAX as i64));
 

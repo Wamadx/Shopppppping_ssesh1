@@ -346,6 +346,140 @@ impl FastInterner {
     }
 }
 
+
+// v5 long IDs: one prefix byte + 32 lowercase hex digits. Packed losslessly to
+// 128 bits, so a lookup compares two words held inline in the slot instead of
+// hashing 33 bytes and chasing the arena pointer for a memcmp.
+static HEX_SLOTS_LOG2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(21);
+
+/// Sizes the long-user-ID table from the input size before parsing starts.
+/// v5 data holds about one distinct long user ID per 10 KB of CSV; the table
+/// keeps load under 0.4 at that rate and still has 60% headroom before full.
+pub fn size_hex_table(input_bytes: u64) {
+    let want = ((input_bytes / 10_000) as usize).saturating_mul(5) / 2;
+    let log2 = want.max(1 << 16).next_power_of_two().trailing_zeros().min(26);
+    HEX_SLOTS_LOG2.store(log2, Ordering::Relaxed);
+}
+
+#[repr(C, align(32))]
+struct HexSlot {
+    key: AtomicU64, // 0 empty, 1 being written, else the canonical Key
+    hi: u64,
+    lo: u64,
+    _pad: u64,
+}
+
+struct HexTable {
+    slots: *mut HexSlot,
+    used: AtomicUsize,
+    log2: u32,
+    limit: usize,
+}
+unsafe impl Sync for HexTable {}
+unsafe impl Send for HexTable {}
+
+static HEX_TABLE: OnceLock<HexTable> = OnceLock::new();
+
+fn hex_table() -> &'static HexTable {
+    HEX_TABLE.get_or_init(|| {
+        let log2 = HEX_SLOTS_LOG2.load(Ordering::Relaxed);
+        let n = 1usize << log2;
+        let layout = std::alloc::Layout::array::<HexSlot>(n).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut HexSlot };
+        assert!(!ptr.is_null());
+        HexTable { slots: ptr, used: AtomicUsize::new(0), log2, limit: n * 7 / 8 }
+    })
+}
+
+/// Packs 32 lowercase hex digits. None unless every byte is [0-9a-f].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn pack_hex32(s: &[u8]) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_loadu_si256(s.as_ptr() as *const __m256i);
+        // digit: '0'..='9'  (0x30..0x39); letter: 'a'..='f' (0x61..0x66)
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(0x61));
+        let is_l = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        let ok = _mm256_or_si256(is_d, is_l);
+        if _mm256_movemask_epi8(ok) != -1 {
+            return None;
+        }
+        // nibble = d for digits, l + 10 for letters
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, is_d);
+        // pairs (hi nibble first) -> bytes
+        let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(w, w); // lanes: [b0..7 b0..7 | b8..15 b8..15]
+        let a = _mm256_extract_epi64(packed, 0) as u64;
+        let b = _mm256_extract_epi64(packed, 2) as u64;
+        Some((a, b))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn pack_hex32(s: &[u8]) -> Option<(u64, u64)> {
+    let mut a = 0u64;
+    let mut b = 0u64;
+    for (i, &c) in s[..32].iter().enumerate() {
+        let n = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        } as u64;
+        if i < 16 { a = (a << 4) | n } else { b = (b << 4) | n }
+    }
+    Some((a, b))
+}
+
+/// Canonical Key for a `u` + 32 lowercase hex ID, or None to use the general path.
+/// Every such string goes through this table only, so canonical keys stay unique.
+#[inline(always)]
+fn intern_hex_user(s: &[u8]) -> Option<Key> {
+    if s.len() != 33 || s[0] != b'u' {
+        return None;
+    }
+    let (hi, lo) = pack_hex32(&s[1..])?;
+    let t = hex_table();
+    let h = (hi ^ lo.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mask = (1usize << t.log2) - 1;
+    let mut pos = (h >> (64 - t.log2)) as usize;
+    loop {
+        let slot = unsafe { &*t.slots.add(pos) };
+        let mut k = slot.key.load(Ordering::Acquire);
+        if k == 0 {
+            match slot.key.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    if t.used.fetch_add(1, Ordering::Relaxed) >= t.limit {
+                        panic!("hex user table full");
+                    }
+                    let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
+                    let key = Key::encode_direct(stored, hash_bytes(s)).expect("hex key");
+                    unsafe {
+                        let sp = t.slots.add(pos);
+                        (*sp).hi = hi;
+                        (*sp).lo = lo;
+                    }
+                    slot.key.store(key.0, Ordering::Release);
+                    return Some(key);
+                }
+                Err(actual) => k = actual,
+            }
+        }
+        while k == 1 {
+            std::hint::spin_loop();
+            k = slot.key.load(Ordering::Acquire);
+        }
+        let (shi, slo) = unsafe { ((*t.slots.add(pos)).hi, (*t.slots.add(pos)).lo) };
+        if shi == hi && slo == lo {
+            return Some(Key(k));
+        }
+        pos = (pos + 1) & mask;
+    }
+}
+
 static FAST_INTERNERS: OnceLock<[FastInterner; NUM_INTERN_SHARDS]> = OnceLock::new();
 
 fn fast_interners() -> &'static [FastInterner; NUM_INTERN_SHARDS] {
@@ -435,6 +569,9 @@ impl Key {
     #[inline(always)]
     fn id_slow(s: &[u8], kind: u8) -> Self {
         if kind != 1 {
+            if let Some(k) = intern_hex_user(s) {
+                return k;
+            }
             return Self::intern_slow(s, hash_bytes(s));
         }
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
@@ -1199,7 +1336,7 @@ impl DateCache {
         let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
             self.last_day_ms
         } else {
-            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> DATE_CACHE_SHIFT)
+            let slot = ((k0 ^ ((k1 as u64) << 48)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> DATE_CACHE_SHIFT)
                 as usize;
             let ent = &self.entries[slot];
             let val = if ent.k0 == k0 && ent.k1 == k1 {
