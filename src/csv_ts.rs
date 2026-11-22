@@ -1199,8 +1199,8 @@ impl DateCache {
         let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
             self.last_day_ms
         } else {
-            let slot = ((k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k1 as u64)) >> DATE_CACHE_SHIFT)
-                as usize;
+            let slot = ((k0 ^ ((k1 as u64) << 48)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                >> DATE_CACHE_SHIFT) as usize;
             let ent = &self.entries[slot];
             let val = if ent.k0 == k0 && ent.k1 == k1 {
                 ent.day_ms
