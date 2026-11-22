@@ -26,7 +26,7 @@ RUN set -eux; \
         cargo build --release --bin shopping-sessions; \
     rm -rf /pgo
 
-FROM busybox:1.37-musl
+FROM scratch
 USER 1000:1000
 COPY --from=builder /build/target/x86_64-unknown-linux-gnu/release/shopping-sessions /app/shopping-sessions
 WORKDIR /app
