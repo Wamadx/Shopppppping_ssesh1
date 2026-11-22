@@ -79,6 +79,13 @@ mod linux_sys {
         (aligned_addr as *mut u8, len)
     }
 
+    /// Read-only private mapping of a whole file, or 0 on failure. Never unmapped (`_exit`).
+    pub fn map_file_ro(fd: i32, len: usize) -> usize {
+        const MAP_FAILED: usize = usize::MAX;
+        let p = unsafe { mmap(ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+        if p as usize == MAP_FAILED { 0 } else { p as usize }
+    }
+
     /// See [`crate::sys::alloc_slab`].
     #[allow(dead_code)]
     pub fn alloc_slab(bytes: usize) -> (*mut u8, usize) {
@@ -371,6 +378,8 @@ pub struct OpenCsvFile {
     pub file: File,
     pub len: u64,
     pub data_start: u64,
+    /// Address of a read-only mapping of the whole file (0 = none; use pread).
+    pub map: usize,
 }
 
 pub struct FileChunk {
@@ -416,10 +425,20 @@ pub fn plan_file_chunks(paths: &[PathBuf], target_chunk_bytes: usize) -> io::Res
     let mut files = Vec::with_capacity(meta.len());
     let mut chunks = Vec::new();
     for (fidx, (len, file, data_start)) in meta.into_iter().enumerate() {
+        #[cfg(target_os = "linux")]
+        let map = if std::env::var_os("SHOP_MMAP").map_or(true, |v| v != "0") {
+            use std::os::fd::AsRawFd;
+            linux_sys::map_file_ro(file.as_raw_fd(), len as usize)
+        } else {
+            0
+        };
+        #[cfg(not(target_os = "linux"))]
+        let map = 0usize;
         files.push(OpenCsvFile {
             file,
             len,
             data_start,
+            map,
         });
         let mut c_start = data_start;
         while c_start < len {
@@ -434,6 +453,48 @@ pub fn plan_file_chunks(paths: &[PathBuf], target_chunk_bytes: usize) -> io::Res
     }
 
     Ok((files, chunks))
+}
+
+/// Zero-copy variant of [`load_chunk_lines`]: when the file is mapped and the chunk's last
+/// line ends at least 4 KiB + 64 B before EOF (so the parser's 64 B over-read stays inside the
+/// file), returns a slice of the mapping with the same `(start, own_end, scan_len)` contract.
+/// Otherwise (unmapped file, the file's tail chunk) it falls back to the pread copy.
+pub fn load_chunk_view<'a>(
+    f: &'a OpenCsvFile,
+    chunk: &FileChunk,
+    buf: &'a mut Vec<u8>,
+) -> io::Result<(&'a [u8], usize, usize, usize)> {
+    const GUARD: u64 = 4096 + 64;
+    if f.map != 0 && chunk.c_end + GUARD < f.len {
+        let base = f.map as *const u8;
+        let len = f.len as usize;
+        let file = unsafe { std::slice::from_raw_parts(base, len) };
+        let read_start = if chunk.c_start > f.data_start { chunk.c_start - 1 } else { chunk.c_start } as usize;
+        let c_end = chunk.c_end as usize;
+        let scan_from = if chunk.c_start > f.data_start {
+            match file[read_start..].iter().position(|&b| b == b'\n') {
+                Some(rel) => rel + 1,
+                None => return Ok((&buf[..0], 0, 0, 0)),
+            }
+        } else {
+            0
+        };
+        let own_end = c_end - read_start;
+        if scan_from >= own_end {
+            return Ok((&buf[..0], 0, 0, 0));
+        }
+        // First '\n' at or after c_end - 1 ends the last owned line.
+        let tail_from = (c_end - 1).max(read_start + scan_from);
+        if let Some(rel) = file[tail_from..].iter().position(|&b| b == b'\n') {
+            let end_abs = tail_from + rel + 1;
+            if (end_abs as u64) + 64 <= f.len {
+                let scan_len = end_abs - read_start;
+                return Ok((&file[read_start..end_abs + 64], scan_from, own_end, scan_len));
+            }
+        }
+    }
+    let (s, o, l) = load_chunk_lines(f, chunk, buf)?;
+    Ok((&buf[..], s, o, l))
 }
 
 /// Reads `[c_start ..]` aligned cleanly to line boundaries with >=64 trailing zeroed bytes.

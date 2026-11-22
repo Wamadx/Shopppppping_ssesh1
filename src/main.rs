@@ -17,7 +17,7 @@ use csv_ts::{
     parse_ts, skip_header,
 };
 use parquet::{CampaignDailyRow, UserDailyWriter, write_campaign_daily};
-use sys::{load_chunk_lines, plan_file_chunks};
+use sys::{load_chunk_view, plan_file_chunks};
 
 const DAY_MS: i64 = 86_400_000;
 const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
@@ -769,10 +769,10 @@ fn load_links_legacy(
                         break;
                     }
                     let ch = &chunks[cidx];
-                    let (start, own_end, scan_len) =
-                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                    let (view, start, own_end, scan_len) =
+                        load_chunk_view(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read link chunk");
-                    for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
+                    for_each_record_simd::<2>(view, start, own_end, scan_len, |[a, b]| {
                         if !a.is_empty() && !b.is_empty() && a != b {
                             local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
                         }
@@ -1309,10 +1309,10 @@ fn load_links_sort(
                         break;
                     }
                     let ch = &chunks[cidx];
-                    let (start, own_end, scan_len) =
-                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                    let (view, start, own_end, scan_len) =
+                        load_chunk_view(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read link chunk");
-                    for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
+                    for_each_record_simd::<2>(view, start, own_end, scan_len, |[a, b]| {
                         if !a.is_empty() && !b.is_empty() && a != b {
                             local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
                         }
@@ -1570,11 +1570,11 @@ fn read_events_parallel(
                         break;
                     }
                     let ch = &chunks[cidx];
-                    let (start, own_end, scan_len) =
-                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                    let (view, start, own_end, scan_len) =
+                        load_chunk_view(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read event chunk");
                     for_each_record_simd::<7>(
-                        &buf,
+                        view,
                         start,
                         own_end,
                         scan_len,
@@ -1688,12 +1688,12 @@ fn read_clicks_parallel(
                         break;
                     }
                     let ch = &chunks[cidx];
-                    let (start, own_end, scan_len) =
-                        load_chunk_lines(&files[ch.file_idx], ch, &mut buf)
+                    let (view, start, own_end, scan_len) =
+                        load_chunk_view(&files[ch.file_idx], ch, &mut buf)
                             .expect("failed to read click chunk");
                     chunk_clks.clear();
                     for_each_record_simd::<4>(
-                        &buf,
+                        view,
                         start,
                         own_end,
                         scan_len,
@@ -2110,11 +2110,11 @@ fn read_events_tickets(
                         break;
                     }
                     let ch = &chunks_ref[cidx];
-                    let (start, own_end, scan_len) =
-                        load_chunk_lines(&files_ref[ch.file_idx], ch, &mut buf)
+                    let (view, start, own_end, scan_len) =
+                        load_chunk_view(&files_ref[ch.file_idx], ch, &mut buf)
                             .expect("failed to read event chunk");
                     for_each_record_simd::<7>(
-                        &buf,
+                        view,
                         start,
                         own_end,
                         scan_len,
