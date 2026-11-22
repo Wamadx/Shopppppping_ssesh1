@@ -60,25 +60,29 @@ impl Drop for InternArena {
 }
 
 impl InternArena {
-    fn alloc(&mut self, s: &[u8]) -> &'static [u8] {
+    fn alloc(&mut self, s: &[u8], hash: u64) -> &'static [u8] {
+        // A hash header lets equality-only IDs keep their content hash in the
+        // same 8-byte Key representation used by canonically interned IDs.
+        let need = 8 + s.len();
         let need_chunk = match self.chunks.last() {
-            Some(chunk) => chunk.capacity() - self.offset < s.len(),
+            Some(chunk) => chunk.capacity() - self.offset < need,
             None => true,
         };
         if need_chunk {
             self.chunks
-                .push(Vec::with_capacity(INTERN_ARENA_CHUNK.max(s.len())));
+                .push(Vec::with_capacity(INTERN_ARENA_CHUNK.max(need)));
             self.offset = 0;
         }
         let chunk = self.chunks.last_mut().unwrap();
         let start = self.offset;
         unsafe {
             let ptr = chunk.as_mut_ptr().add(start);
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, s.len());
-            self.offset = start + s.len();
+            (ptr as *mut u64).write_unaligned(hash.to_le());
+            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(8), s.len());
+            self.offset = start + need;
             // INTERNERS and its arena allocations live until process exit. No
             // later allocation writes this range or reallocates this chunk.
-            std::slice::from_raw_parts(ptr, s.len())
+            std::slice::from_raw_parts(ptr.add(8), s.len())
         }
     }
 }
@@ -149,7 +153,7 @@ impl Interner {
             pos = (pos + 1) & mask;
         }
         let idx = u32::try_from(self.slices.len()).expect("too many interned IDs");
-        let stored = self.arena.alloc(s);
+        let stored = self.arena.alloc(s, hash);
         self.slices.push(stored);
         self.slots[pos] = InternSlot {
             hash,
@@ -253,7 +257,7 @@ impl FastInterner {
             return None;
         }
 
-        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
+        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s, hash));
         unsafe {
             *self.entries[idx].get() = FastEntry {
                 hash,
@@ -334,18 +338,25 @@ impl Key {
 
     #[inline(always)]
     pub fn from_bytes(s: &[u8]) -> Self {
-        Self::from_bytes_impl(s, true)
+        Self::from_bytes_impl(s, 0)
     }
 
     /// Keeps stable bytes for comparisons but does not canonicalize identity.
     /// Only for fields such as click_id that are ordered, never hashed/routed.
     #[inline(always)]
     pub fn from_bytes_unordered(s: &[u8]) -> Self {
-        Self::from_bytes_impl(s, false)
+        Self::from_bytes_impl(s, 1)
+    }
+
+    /// Equality-only IDs keep their original bytes and content hash, without
+    /// forcing alternate copies of one value to have the same pointer.
+    #[inline(always)]
+    pub fn from_bytes_equality(s: &[u8]) -> Self {
+        Self::from_bytes_impl(s, 2)
     }
 
     #[inline(always)]
-    fn from_bytes_impl(s: &[u8], intern: bool) -> Self {
+    fn from_bytes_impl(s: &[u8], kind: u8) -> Self {
         let len = s.len();
         if len >= 1 && len <= 9 {
             #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -353,7 +364,7 @@ impl Key {
                 if let Some(k) = unsafe { Self::pack_bmi2(s) } {
                     return k;
                 }
-                return Self::id_slow(s, intern);
+                return Self::id_slow(s, kind);
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             {
@@ -363,7 +374,7 @@ impl Key {
                 while i < len {
                     let b = s[i];
                     if b == 0 || b >= 0x80 {
-                        return Self::id_slow(s, intern);
+                        return Self::id_slow(s, kind);
                     }
                     acc |= (b as u64) << shift;
                     shift -= 7;
@@ -372,15 +383,16 @@ impl Key {
                 return Self(acc);
             }
         }
-        Self::id_slow(s, intern)
+        Self::id_slow(s, kind)
     }
 
     #[inline(always)]
-    fn id_slow(s: &[u8], intern: bool) -> Self {
-        if intern {
+    fn id_slow(s: &[u8], kind: u8) -> Self {
+        if kind == 0 {
             return Self::intern_slow(s, hash_bytes(s));
         }
-        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
+        let hash = if kind == 2 { hash_bytes(s) } else { 0 };
+        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s, hash));
         let ptr = stored.as_ptr() as usize as u64;
         let len = stored.len() as u64;
         if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
@@ -521,6 +533,24 @@ impl Key {
         let x = self.0 ^ (self.0 >> 32);
         let r = (x as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (r as u64) ^ ((r >> 64) as u64)
+    }
+
+    #[inline(always)]
+    pub fn equality_hash64(self) -> u64 {
+        if (self.0 & INTERNED_BIT) == 0 {
+            return self.hash64();
+        }
+        let len = ((self.0 >> INTERNED_LEN_SHIFT) & INTERNED_LEN_MASK) as usize;
+        if len != 0 {
+            let ptr = (self.0 & INTERNED_PTR_MASK) as *const u8;
+            return u64::from_le(unsafe { (ptr as *const u64).sub(1).read_unaligned() });
+        }
+        hash_bytes(self.long_bytes())
+    }
+
+    #[inline(always)]
+    pub fn equality_eq(self, other: Self) -> bool {
+        self == other || self.cmp_bytes(&other) == std::cmp::Ordering::Equal
     }
 
     #[inline]
