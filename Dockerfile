@@ -30,4 +30,5 @@ FROM busybox:1.37-musl
 USER 1000:1000
 COPY --from=builder /build/target/x86_64-unknown-linux-gnu/release/shopping-sessions /app/shopping-sessions
 WORKDIR /app
+ENV SHOP_SNAPPY=0
 CMD ["/app/shopping-sessions"]
