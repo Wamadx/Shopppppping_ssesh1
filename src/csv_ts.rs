@@ -48,7 +48,16 @@ impl EidArena {
                 }
             }
         }
-        if len == 33 && s[0] == b'e' && worker_id < 16 {
+        self.encode_long(s, worker_id)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn encode_long(&mut self, s: &[u8], worker_id: usize) -> Option<Key> {
+        if worker_id >= 16 || s.len() > u16::MAX as usize {
+            return None;
+        }
+        if s.len() == 33 && s[0] == b'e' {
             if let Some((hi, lo)) = pack_hex32(&s[1..]) {
                 let idx = self.hex_eids.len();
                 if idx < (1 << 25) {
@@ -64,14 +73,6 @@ impl EidArena {
                     ));
                 }
             }
-        }
-        self.encode_long(s, worker_id)
-    }
-
-    #[inline]
-    fn encode_long(&mut self, s: &[u8], worker_id: usize) -> Option<Key> {
-        if worker_id >= 16 || s.len() > u16::MAX as usize {
-            return None;
         }
         let aligned = (self.buf.len() + 3) & !3;
         let need = aligned.checked_add(2)?.checked_add(s.len())?;
@@ -395,10 +396,10 @@ static HEX_SLOTS_LOG2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// Sizes the long-user-ID table from the input size before parsing starts.
 /// v5 data holds about one distinct long user ID per 10 KB of CSV; the table
 /// keeps load under 0.4 at that rate and still has 60% headroom before full.
-pub fn size_hex_table(ev_clk_bytes: u64, links_bytes: u64) {
-    let want = (((ev_clk_bytes / 8_000) + (links_bytes / 32)) as usize).saturating_mul(5) / 2;
-    let slots = want.next_power_of_two().clamp(1 << 16, 1 << 24);
-    HEX_SLOTS_LOG2.store(slots.trailing_zeros(), Ordering::Relaxed);
+pub fn size_hex_table(input_bytes: u64) {
+    let want = ((input_bytes / 10_000) as usize).saturating_mul(5) / 2;
+    let log2 = want.max(1 << 16).next_power_of_two().trailing_zeros().min(26);
+    HEX_SLOTS_LOG2.store(log2, Ordering::Relaxed);
 }
 
 #[repr(C, align(32))]
@@ -1066,60 +1067,29 @@ unsafe fn for_each_record_avx2<const N: usize>(
                     let line_qt1 = qt1 & before_nl1;
                     if (line_cm0.count_ones() + line_cm1.count_ones()) as usize == N - 1 {
                         let total_q = qt.count_ones() + line_qt1.count_ones();
-                        if total_q == 0 {
-                            let mut j = 0usize;
-                            while line_cm0 != 0 {
-                                let cb_bit = line_cm0.trailing_zeros();
-                                let coff = blk + cb_bit as usize;
-                                unsafe {
-                                    *fields.get_unchecked_mut(j) =
-                                        std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart);
-                                }
-                                j += 1;
-                                cur_fstart = coff + 1;
-                                line_cm0 &= line_cm0 - 1;
-                            }
-                            while line_cm1 != 0 {
-                                let cb_bit = line_cm1.trailing_zeros();
-                                let coff = blk1 + cb_bit as usize;
-                                unsafe {
-                                    *fields.get_unchecked_mut(j) =
-                                        std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart);
-                                }
-                                j += 1;
-                                cur_fstart = coff + 1;
-                                line_cm1 &= line_cm1 - 1;
-                            }
-                            unsafe {
-                                *fields.get_unchecked_mut(N - 1) =
-                                    std::slice::from_raw_parts(ptr.add(cur_fstart), nl_off - cur_fstart);
-                            }
+                        let mut j = 0usize;
+                        while line_cm0 != 0 {
+                            let cb_bit = line_cm0.trailing_zeros();
+                            let coff = blk + cb_bit as usize;
+                            f_starts[j] = cur_fstart;
+                            f_ends[j] = coff;
+                            j += 1;
+                            cur_fstart = coff + 1;
+                            line_cm0 &= line_cm0 - 1;
+                        }
+                        while line_cm1 != 0 {
+                            let cb_bit = line_cm1.trailing_zeros();
+                            let coff = blk1 + cb_bit as usize;
+                            f_starts[j] = cur_fstart;
+                            f_ends[j] = coff;
+                            j += 1;
+                            cur_fstart = coff + 1;
+                            line_cm1 &= line_cm1 - 1;
+                        }
+                        f_starts[N - 1] = cur_fstart;
+                        f_ends[N - 1] = nl_off;
+                        if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
                             cb(fields);
-                        } else {
-                            let mut j = 0usize;
-                            while line_cm0 != 0 {
-                                let cb_bit = line_cm0.trailing_zeros();
-                                let coff = blk + cb_bit as usize;
-                                f_starts[j] = cur_fstart;
-                                f_ends[j] = coff;
-                                j += 1;
-                                cur_fstart = coff + 1;
-                                line_cm0 &= line_cm0 - 1;
-                            }
-                            while line_cm1 != 0 {
-                                let cb_bit = line_cm1.trailing_zeros();
-                                let coff = blk1 + cb_bit as usize;
-                                f_starts[j] = cur_fstart;
-                                f_ends[j] = coff;
-                                j += 1;
-                                cur_fstart = coff + 1;
-                                line_cm1 &= line_cm1 - 1;
-                            }
-                            f_starts[N - 1] = cur_fstart;
-                            f_ends[N - 1] = nl_off;
-                            if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
-                                cb(fields);
-                            }
                         }
                     }
                     let next_line = nl_off + 1;
@@ -1143,36 +1113,18 @@ unsafe fn for_each_record_avx2<const N: usize>(
 
                 if fidx == 0 && !too_many && line_commas == N - 1 {
                     let total_q = q_cnt + line_qt.count_ones();
-                    if total_q == 0 {
-                        for j in 0..(N - 1) {
-                            let cb_bit = line_cm.trailing_zeros();
-                            let coff = blk + cb_bit as usize;
-                            unsafe {
-                                *fields.get_unchecked_mut(j) =
-                                    std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart);
-                            }
-                            cur_fstart = coff + 1;
-                            line_cm &= line_cm - 1;
-                        }
-                        unsafe {
-                            *fields.get_unchecked_mut(N - 1) =
-                                std::slice::from_raw_parts(ptr.add(cur_fstart), nl_off - cur_fstart);
-                        }
+                    for j in 0..(N - 1) {
+                        let cb_bit = line_cm.trailing_zeros();
+                        let coff = blk + cb_bit as usize;
+                        f_starts[j] = cur_fstart;
+                        f_ends[j] = coff;
+                        cur_fstart = coff + 1;
+                        line_cm &= line_cm - 1;
+                    }
+                    f_starts[N - 1] = cur_fstart;
+                    f_ends[N - 1] = nl_off;
+                    if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
                         cb(fields);
-                    } else {
-                        for j in 0..(N - 1) {
-                            let cb_bit = line_cm.trailing_zeros();
-                            let coff = blk + cb_bit as usize;
-                            f_starts[j] = cur_fstart;
-                            f_ends[j] = coff;
-                            cur_fstart = coff + 1;
-                            line_cm &= line_cm - 1;
-                        }
-                        f_starts[N - 1] = cur_fstart;
-                        f_ends[N - 1] = nl_off;
-                        if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
-                            cb(fields);
-                        }
                     }
                 } else if !too_many && fidx + line_commas == N - 1 {
                     let total_q = q_cnt + line_qt.count_ones();
@@ -1441,14 +1393,21 @@ struct DateEntry {
 }
 
 pub struct DateCache {
+    last_k0: u64,
+    last_k1: u16,
+    last_day_ms: i64,
     entries: [DateEntry; DATE_CACHE_SLOTS],
 }
 
-const DATE_CACHE_SLOTS: usize = 128;
+const DATE_CACHE_SLOTS: usize = 256;
+const DATE_CACHE_SHIFT: u32 = 56; // 64 - log2(DATE_CACHE_SLOTS)
 
 impl DateCache {
     pub fn new() -> Self {
         Self {
+            last_k0: u64::MAX,
+            last_k1: u16::MAX,
+            last_day_ms: i64::MIN,
             entries: [DateEntry {
                 k0: u64::MAX,
                 k1: u16::MAX,
@@ -1458,26 +1417,31 @@ impl DateCache {
     }
 
     /// Epoch ms of the `YYYY-MM-DD` date in `s[0..10]`, memoised by its exact
-    /// 10 bytes. Indexed by `(4 months × 32 days)` = 2 KiB L1d with zero 27-day collisions.
+    /// 10 bytes. Returns None for an invalid date (also memoised).
     #[inline(always)]
     fn cached_day_ms(&mut self, s: &[u8]) -> Option<i64> {
         let k0 = u64::from_ne_bytes(s[0..8].try_into().unwrap());
         let k1 = u16::from_ne_bytes(s[8..10].try_into().unwrap());
-        let m_idx = (k0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62) as usize;
-        let d_num = ((s[8] as usize & 0x0F) * 10 + (s[9] as usize & 0x0F)) & 31;
-        let slot = (m_idx << 5) | d_num;
-        let ent = unsafe { self.entries.get_unchecked(slot) };
-        let d_ms = if ent.k0 == k0 && ent.k1 == k1 {
-            ent.day_ms
+        let d_ms = if k0 == self.last_k0 && k1 == self.last_k1 {
+            self.last_day_ms
         } else {
-            let val = parse_date_10(&s[0..10]).unwrap_or(i64::MIN);
-            unsafe {
-                *self.entries.get_unchecked_mut(slot) = DateEntry {
+            let slot = ((k0 ^ ((k1 as u64) << 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                >> DATE_CACHE_SHIFT) as usize;
+            let ent = &self.entries[slot];
+            let val = if ent.k0 == k0 && ent.k1 == k1 {
+                ent.day_ms
+            } else {
+                let val = parse_date_10(&s[0..10]).unwrap_or(i64::MIN);
+                self.entries[slot] = DateEntry {
                     k0,
                     k1,
                     day_ms: val,
                 };
-            }
+                val
+            };
+            self.last_k0 = k0;
+            self.last_k1 = k1;
+            self.last_day_ms = val;
             val
         };
         if d_ms == i64::MIN { None } else { Some(d_ms) }

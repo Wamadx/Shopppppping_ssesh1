@@ -441,7 +441,7 @@ impl LocalPersonMap {
     }
 
     fn reset(&mut self, needed: usize) {
-        let cap = (needed / 12).max(1024).next_power_of_two();
+        let cap = (needed / 8).max(1024).next_power_of_two();
         if cap > self.entries.len() {
             self.entries.resize(
                 cap,
@@ -1124,30 +1124,8 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     // suffix) through the byte sort; the merge must remap that original rank.
     let ln = n - p;
     let mut long = unsafe { uninit_vec::<LongOrderRec>(ln) };
-    let lt = ncpu.min((ln / 16384).max(1));
-    if lt == 1 {
-        for (idx, &k) in u[p..].iter().enumerate() {
-            long[idx] = LongOrderRec::new(Key(k), p + idx);
-        }
-    } else {
-        let lbuf = SharedBuf(UnsafeCell::new(long));
-        let us = &u[p..];
-        thread::scope(|s| {
-            for tid in 0..lt {
-                let (lo, hi) = range_of(ln, lt, tid);
-                let lb = &lbuf;
-                s.spawn(move || {
-                    let lw = unsafe { &mut *lb.0.get() };
-                    for idx in lo..hi {
-                        unsafe {
-                            *lw.get_unchecked_mut(idx) =
-                                LongOrderRec::new(Key(*us.get_unchecked(idx)), p + idx);
-                        }
-                    }
-                });
-            }
-        });
-        long = lbuf.0.into_inner();
+    for (idx, &k) in u[p..].iter().enumerate() {
+        unsafe { *long.get_unchecked_mut(idx) = LongOrderRec::new(Key(k), p + idx) };
     }
     radix_sort_long_order(&mut long);
     let mut nu = vec![0u64; n];
@@ -1368,11 +1346,6 @@ fn load_links_sort(
             handles.push(s.spawn(|| {
                 let mut local_pairs: Vec<(Key, Key)> = Vec::new();
                 let mut buf = Vec::new();
-                const HEX_RING: usize = 16;
-                let mut ring: [(usize, u8, csv_ts::HexProbe, *const u8); HEX_RING] =
-                    [(0, 0, csv_ts::HexProbe::default(), std::ptr::null()); HEX_RING];
-                let mut ring_n = 0usize;
-                let mut ring_head = 0usize;
                 loop {
                     let cidx = next_chunk.fetch_add(1, Ordering::Relaxed);
                     if cidx >= chunks.len() {
@@ -1384,65 +1357,9 @@ fn load_links_sort(
                             .expect("failed to read link chunk");
                     for_each_record_simd::<2>(&buf, start, own_end, scan_len, |[a, b]| {
                         if !a.is_empty() && !b.is_empty() && a != b {
-                            let pidx = local_pairs.len();
-                            let ka = if let Some(pr) = csv_ts::hex_user_probe(a) {
-                                if ring_n == HEX_RING {
-                                    let (idx, side, ref op, optr) = ring[ring_head];
-                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
-                                    let k = csv_ts::hex_user_resolve(op, os);
-                                    let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
-                                    if side == 0 {
-                                        slot.0 = k;
-                                    } else {
-                                        slot.1 = k;
-                                    }
-                                    ring_head = (ring_head + 1) % HEX_RING;
-                                    ring_n -= 1;
-                                }
-                                let rslot = (ring_head + ring_n) % HEX_RING;
-                                ring[rslot] = (pidx, 0, pr, a.as_ptr());
-                                ring_n += 1;
-                                Key::EMPTY
-                            } else {
-                                Key::from_bytes(a)
-                            };
-                            let kb = if let Some(pr) = csv_ts::hex_user_probe(b) {
-                                if ring_n == HEX_RING {
-                                    let (idx, side, ref op, optr) = ring[ring_head];
-                                    let os = unsafe { std::slice::from_raw_parts(optr, 33) };
-                                    let k = csv_ts::hex_user_resolve(op, os);
-                                    let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
-                                    if side == 0 {
-                                        slot.0 = k;
-                                    } else {
-                                        slot.1 = k;
-                                    }
-                                    ring_head = (ring_head + 1) % HEX_RING;
-                                    ring_n -= 1;
-                                }
-                                let rslot = (ring_head + ring_n) % HEX_RING;
-                                ring[rslot] = (pidx, 1, pr, b.as_ptr());
-                                ring_n += 1;
-                                Key::EMPTY
-                            } else {
-                                Key::from_bytes(b)
-                            };
-                            local_pairs.push((ka, kb));
+                            local_pairs.push((Key::from_bytes(a), Key::from_bytes(b)));
                         }
                     });
-                    while ring_n > 0 {
-                        let (idx, side, ref op, optr) = ring[ring_head];
-                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
-                        let k = csv_ts::hex_user_resolve(op, os);
-                        let slot = unsafe { local_pairs.get_unchecked_mut(idx) };
-                        if side == 0 {
-                            slot.0 = k;
-                        } else {
-                            slot.1 = k;
-                        }
-                        ring_head = (ring_head + 1) % HEX_RING;
-                        ring_n -= 1;
-                    }
                 }
                 local_pairs
             }));
@@ -1794,7 +1711,7 @@ fn read_clicks_parallel(
         return Ok(WorkerMatrix::new(Vec::new()));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_click_shard_cap = ((total_bytes / 48) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
+    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<PersonClick>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
@@ -2256,10 +2173,11 @@ fn read_events_tickets(
         return Ok(Some((WorkerMatrix::new(Vec::new()), Vec::new(), Vec::new())));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_shard_cap = ((total_bytes / 70) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(64);
-    let per_worker_payload_cap = ((total_bytes / 74) as usize / ncpu).max(1024);
+    // >= 2048 tickets (32 KiB) keeps every shard Vec on the huge-page slab allocator.
+    let per_shard_cap = ((total_bytes / 56) as usize / (ncpu * NUM_DEDUP_SHARDS)).max(2048);
+    let per_worker_payload_cap = ((total_bytes / 52) as usize / ncpu).max(1024);
     let eid_arena_cap = ((total_bytes / 180) as usize / ncpu).max(64 * 1024);
-    let eid_hex_cap = ((total_bytes / 80) as usize / ncpu / 7).max(4096);
+    let eid_hex_cap = ((total_bytes / 56) as usize / ncpu / 7).max(4096);
     let ingest_base_s = base_ts.div_euclid(1000) - (1i64 << 31);
     let loc_max = cfg.ticket_loc_max as usize;
     let bail = AtomicBool::new(false);
@@ -2669,21 +2587,15 @@ fn main() -> io::Result<()> {
 
     let (window_start, window_end) = parse_manifest(&data_dir.join("manifest.json"))?;
     {
-        let mut ev_clk_bytes = 0u64;
-        for sub in ["events", "clicks"] {
+        let mut bytes = 0u64;
+        for sub in ["events", "clicks", "links"] {
             if let Ok(rd) = std::fs::read_dir(data_dir.join(sub)) {
                 for e in rd.flatten() {
-                    ev_clk_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
                 }
             }
         }
-        let mut links_bytes = 0u64;
-        if let Ok(rd) = std::fs::read_dir(data_dir.join("links")) {
-            for e in rd.flatten() {
-                links_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
-            }
-        }
-        csv_ts::size_hex_table(ev_clk_bytes, links_bytes);
+        csv_ts::size_hex_table(bytes);
     }
     let base_ts = window_start - SEVEN_DAYS_MS;
     assert!((window_end - base_ts) < (u32::MAX as i64));
