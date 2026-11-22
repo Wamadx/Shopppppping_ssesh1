@@ -1592,7 +1592,7 @@ fn read_clicks_parallel(
                             }
                             let raw_uid = Key::from_bytes(uid);
                             let person_id = links.resolve(raw_uid, &mut link_cache);
-                            let click_id = Key::from_bytes(clid);
+                            let click_id = Key::from_bytes_unordered(clid);
                             let shard = (person_id.hash64() >> PERSON_SHIFT) as usize;
                             out[shard].push(PersonClick {
                                 person_id,

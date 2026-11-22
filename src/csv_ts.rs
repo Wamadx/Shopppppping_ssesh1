@@ -334,6 +334,18 @@ impl Key {
 
     #[inline(always)]
     pub fn from_bytes(s: &[u8]) -> Self {
+        Self::from_bytes_impl(s, true)
+    }
+
+    /// Keeps stable bytes for comparisons but does not canonicalize identity.
+    /// Only for fields such as click_id that are ordered, never hashed/routed.
+    #[inline(always)]
+    pub fn from_bytes_unordered(s: &[u8]) -> Self {
+        Self::from_bytes_impl(s, false)
+    }
+
+    #[inline(always)]
+    fn from_bytes_impl(s: &[u8], intern: bool) -> Self {
         let len = s.len();
         if len >= 1 && len <= 9 {
             #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -341,7 +353,7 @@ impl Key {
                 if let Some(k) = unsafe { Self::pack_bmi2(s) } {
                     return k;
                 }
-                return Self::intern_slow(s, hash_bytes(s));
+                return Self::id_slow(s, intern);
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             {
@@ -351,7 +363,7 @@ impl Key {
                 while i < len {
                     let b = s[i];
                     if b == 0 || b >= 0x80 {
-                        return Self::intern_slow(s, hash_bytes(s));
+                        return Self::id_slow(s, intern);
                     }
                     acc |= (b as u64) << shift;
                     shift -= 7;
@@ -360,7 +372,22 @@ impl Key {
                 return Self(acc);
             }
         }
-        Self::intern_slow(s, hash_bytes(s))
+        Self::id_slow(s, intern)
+    }
+
+    #[inline(always)]
+    fn id_slow(s: &[u8], intern: bool) -> Self {
+        if intern {
+            return Self::intern_slow(s, hash_bytes(s));
+        }
+        let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
+        let ptr = stored.as_ptr() as usize as u64;
+        let len = stored.len() as u64;
+        if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
+            Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
+        } else {
+            Self::intern_slow(s, hash_bytes(s))
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
