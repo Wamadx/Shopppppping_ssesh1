@@ -19,6 +19,13 @@ use csv_ts::{
 use parquet::{CampaignDailyRow, UserDailyWriter, write_campaign_daily};
 use sys::{load_chunk_lines, plan_file_chunks};
 
+#[inline]
+unsafe fn uninit_vec<T>(len: usize) -> Vec<T> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
 const DAY_MS: i64 = 86_400_000;
 const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
 const SEVEN_DAYS_REL: u32 = SEVEN_DAYS_MS as u32;
@@ -388,9 +395,15 @@ impl DedupTable {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LocalPersonEntry {
+    key: u64,
+    id: u32,
+    stamp: u16,
+}
+
 struct LocalPersonMap {
-    entries: Vec<(u64, u32)>,
-    stamps: Vec<u16>,
+    entries: Vec<LocalPersonEntry>,
     epoch: u16,
     mask: usize,
 }
@@ -399,8 +412,7 @@ impl LocalPersonMap {
     fn new(initial_pow2: usize) -> Self {
         let cap = initial_pow2.next_power_of_two().max(1024);
         Self {
-            entries: vec![(0, 0); cap],
-            stamps: vec![0; cap],
+            entries: vec![LocalPersonEntry { key: 0, id: 0, stamp: 0 }; cap],
             epoch: 1,
             mask: cap - 1,
         }
@@ -409,13 +421,15 @@ impl LocalPersonMap {
     fn reset(&mut self, needed: usize) {
         let cap = (needed / 4).max(1024).next_power_of_two();
         if cap > self.entries.len() {
-            self.entries.resize(cap, (0, 0));
-            self.stamps.resize(cap, 0);
+            self.entries
+                .resize(cap, LocalPersonEntry { key: 0, id: 0, stamp: 0 });
         }
         self.mask = cap - 1;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            self.stamps.fill(0);
+            for e in &mut self.entries {
+                e.stamp = 0;
+            }
             self.epoch = 1;
         }
     }
@@ -424,29 +438,25 @@ impl LocalPersonMap {
     fn grow(&mut self) {
         let old_cap = self.mask + 1;
         let new_cap = old_cap * 2;
-        let mut new_entries = vec![(0u64, 0u32); new_cap];
-        let mut new_stamps = vec![0u16; new_cap];
+        let mut new_entries = vec![LocalPersonEntry { key: 0, id: 0, stamp: 0 }; new_cap];
         let new_mask = new_cap - 1;
         for i in 0..old_cap {
-            if self.stamps[i] == self.epoch {
-                let (k, id) = self.entries[i];
-                let mut idx = (Key(k).hash64() as usize) & new_mask;
-                while new_stamps[idx] == self.epoch {
+            let e = self.entries[i];
+            if e.stamp == self.epoch {
+                let mut idx = (Key(e.key).hash64() as usize) & new_mask;
+                while new_entries[idx].stamp == self.epoch {
                     idx = (idx + 1) & new_mask;
                 }
-                new_stamps[idx] = self.epoch;
-                new_entries[idx] = (k, id);
+                new_entries[idx] = e;
             }
         }
         self.entries = new_entries;
-        self.stamps = new_stamps;
         self.mask = new_mask;
     }
 
     #[inline(always)]
     fn prefetch(&self, key: Key) {
         let idx = (key.hash64() as usize) & self.mask;
-        prefetch_ro(self.stamps.as_ptr().wrapping_add(idx));
         prefetch_ro(self.entries.as_ptr().wrapping_add(idx));
     }
 
@@ -455,21 +465,24 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
+            let e = unsafe { *self.entries.get_unchecked(idx) };
+            if e.stamp != self.epoch {
                 let id = *next_id;
                 *next_id = id + 1;
                 unsafe {
-                    *self.stamps.get_unchecked_mut(idx) = self.epoch;
-                    *self.entries.get_unchecked_mut(idx) = (k, id);
+                    *self.entries.get_unchecked_mut(idx) = LocalPersonEntry {
+                        key: k,
+                        id,
+                        stamp: self.epoch,
+                    };
                 }
                 if ((*next_id as usize) * 2) >= self.mask + 1 {
                     self.grow();
                 }
                 return (id, true);
             }
-            let e = unsafe { *self.entries.get_unchecked(idx) };
-            if e.0 == k {
-                return (e.1, false);
+            if e.key == k {
+                return (e.id, false);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -480,12 +493,12 @@ impl LocalPersonMap {
         let k = key.0;
         let mut idx = (key.hash64() as usize) & self.mask;
         loop {
-            if unsafe { *self.stamps.get_unchecked(idx) } != self.epoch {
+            let e = unsafe { *self.entries.get_unchecked(idx) };
+            if e.stamp != self.epoch {
                 return None;
             }
-            let e = unsafe { *self.entries.get_unchecked(idx) };
-            if e.0 == k {
-                return Some(e.1);
+            if e.key == k {
+                return Some(e.id);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -961,8 +974,8 @@ fn rank_recs(recs: &[EndRec], ncpu: usize) -> (Vec<u64>, Vec<u32>) {
         offs[tid] = total;
         total += counts[tid];
     }
-    let ubuf = SharedBuf(UnsafeCell::new(vec![0u64; total]));
-    let hbuf = SharedBuf(UnsafeCell::new(vec![0u32; n]));
+    let ubuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u64>(total) }));
+    let hbuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<u32>(n) }));
     thread::scope(|s| {
         for tid in 0..t {
             let (lo, hi) = range_of(n, t, tid);
@@ -1079,11 +1092,31 @@ fn fix_interned(u: &mut Vec<u64>, halves: &mut Vec<u32>, ncpu: usize) {
     let p = u.partition_point(|&k| (k & IB) == 0);
     // Carry each interned key's ORIGINAL rank (p + position in the u64-sorted
     // suffix) through the byte sort; the merge must remap that original rank.
-    let mut long: Vec<LongOrderRec> = u[p..]
-        .iter()
-        .enumerate()
-        .map(|(idx, &k)| LongOrderRec::new(Key(k), p + idx))
-        .collect();
+    let long_slice = &u[p..];
+    let ln = long_slice.len();
+    let lt = ncpu.min((ln / 16384).max(1));
+    let mut long: Vec<LongOrderRec> = if lt <= 1 {
+        long_slice
+            .iter()
+            .enumerate()
+            .map(|(idx, &k)| LongOrderRec::new(Key(k), p + idx))
+            .collect()
+    } else {
+        let lbuf = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<LongOrderRec>(ln) }));
+        thread::scope(|s| {
+            for tid in 0..lt {
+                let (lo, hi) = range_of(ln, lt, tid);
+                let lb = &lbuf;
+                s.spawn(move || {
+                    let lw = unsafe { &mut *lb.0.get() };
+                    for idx in lo..hi {
+                        lw[idx] = LongOrderRec::new(Key(long_slice[idx]), p + idx);
+                    }
+                });
+            }
+        });
+        lbuf.0.into_inner()
+    };
     radix_sort_long_order(&mut long);
     let mut nu = vec![0u64; n];
     let mut remap = vec![0u32; n];
@@ -1340,9 +1373,8 @@ fn load_links_sort(
         acc += pv.len();
     }
     woff.push(acc);
-    let zero = EndRec { key: 0, refr: 0 };
-    let recs = SharedBuf(UnsafeCell::new(vec![zero; 2 * e]));
-    let mut scratch = vec![zero; 2 * e];
+    let recs = SharedBuf(UnsafeCell::new(unsafe { uninit_vec::<EndRec>(2 * e) }));
+    let mut scratch = unsafe { uninit_vec::<EndRec>(2 * e) };
     thread::scope(|s| {
         let mut hs = Vec::with_capacity(pairs_per_worker.len());
         for (w, pv) in pairs_per_worker.iter().enumerate() {
@@ -1669,7 +1701,7 @@ fn read_clicks_parallel(
         return Ok(WorkerMatrix::new(Vec::new()));
     }
     let total_bytes: u64 = files.iter().map(|f| f.len.saturating_sub(f.data_start)).sum();
-    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(32);
+    let per_click_shard_cap = ((total_bytes / 42) as usize / (ncpu * NUM_PERSON_SHARDS)).max(1366);
     let next_chunk = AtomicUsize::new(0);
     let workers: Vec<Vec<Vec<PersonClick>>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(ncpu);
@@ -1751,6 +1783,24 @@ fn insertion_sort_u64(arr: &mut [u64]) {
         let key = arr[i];
         let mut j = i;
         while j > 0 && arr[j - 1] > key {
+            arr[j] = arr[j - 1];
+            j -= 1;
+        }
+        arr[j] = key;
+    }
+}
+
+#[inline]
+fn insertion_sort_clicks(arr: &mut [CompactClick]) {
+    for i in 1..arr.len() {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0
+            && (arr[j - 1].ts_rel > key.ts_rel
+                || (arr[j - 1].ts_rel == key.ts_rel
+                    && key.click_id.cmp_bytes(&arr[j - 1].click_id)
+                        == std::cmp::Ordering::Greater))
+        {
             arr[j] = arr[j - 1];
             j -= 1;
         }
@@ -2126,8 +2176,21 @@ fn read_events_tickets(
                             else {
                                 return;
                             };
-                            let ing_rel = ingest_ts.div_euclid(1000) - ingest_base_s;
-                            if ingest_ts.rem_euclid(1000) != 0 || ing_rel < 0 || ing_rel > u32::MAX as i64 {
+                            let ing_rel = if ingest_ts >= 0 {
+                                let u = ingest_ts as u64;
+                                if u % 1000 != 0 {
+                                    bad = true;
+                                    return;
+                                }
+                                (u / 1000) as i64 - ingest_base_s
+                            } else {
+                                if ingest_ts.rem_euclid(1000) != 0 {
+                                    bad = true;
+                                    return;
+                                }
+                                ingest_ts.div_euclid(1000) - ingest_base_s
+                            };
+                            if ing_rel < 0 || ing_rel > u32::MAX as i64 {
                                 bad = true;
                                 return;
                             }
@@ -2291,8 +2354,7 @@ fn dedup_route_tickets(
                 let mut table = TicketTable::new();
                 let mut cand: Vec<(Ticket, u32)> = Vec::new();
                 let mut kept: Vec<(Ticket, u32)> = Vec::new();
-                let mut seen_bm: Vec<u64> = Vec::new();
-                let mut dup_bm: Vec<u64> = Vec::new();
+                let mut bm: Vec<(u64, u64)> = Vec::new();
                 // Each payload has exactly one ticket, so no element is ever written by two threads.
                 let kill = |t: u32, loc: u32| {
                     if loc != LOC_NONE {
@@ -2313,18 +2375,16 @@ fn dedup_route_tickets(
                     let bm_mask = bm_bits.wrapping_sub(1);
                     if bm_on {
                         let words = bm_bits / 64;
-                        seen_bm.clear();
-                        seen_bm.resize(words, 0);
-                        dup_bm.clear();
-                        dup_bm.resize(words, 0);
+                        bm.clear();
+                        bm.resize(words, (0, 0));
                         for t in 0..ew {
                             for tk in unsafe { tickets.get_mut(t, sh) }.iter() {
                                 let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
                                 let (w, m) = (b >> 6, 1u64 << (b & 63));
-                                let sw = unsafe { seen_bm.get_unchecked_mut(w) };
-                                let hit = *sw & m;
-                                *sw |= m;
-                                unsafe { *dup_bm.get_unchecked_mut(w) |= hit };
+                                let slot = unsafe { bm.get_unchecked_mut(w) };
+                                let hit = slot.0 & m;
+                                slot.0 |= m;
+                                slot.1 |= hit;
                             }
                         }
                     }
@@ -2334,7 +2394,7 @@ fn dedup_route_tickets(
                         for tk in raw.iter() {
                             if bm_on {
                                 let b = ((tk.event_id.eid_hash64() >> 8) as usize) & bm_mask;
-                                if unsafe { *dup_bm.get_unchecked(b >> 6) } & (1u64 << (b & 63)) == 0 {
+                                if unsafe { bm.get_unchecked(b >> 6) }.1 & (1u64 << (b & 63)) == 0 {
                                     continue;
                                 }
                             }
@@ -2380,7 +2440,7 @@ fn dedup_route_tickets(
             st = en;
         }
     }
-    let per_person_shard_cap = (total_payloads / (ncpu * NUM_PERSON_SHARDS)).max(64);
+    let per_person_shard_cap = ((total_payloads * 17 / 16) / (ncpu * NUM_PERSON_SHARDS)).max(2048);
     let next_unit = AtomicUsize::new(0);
     let payloads_ref = &payloads;
     let units_ref = &units;
@@ -2643,7 +2703,11 @@ fn main() -> io::Result<()> {
                         }
                         bin_offs[num_bins] = bacc;
 
-                        bin_buf.resize(total_evs, (0, 0));
+                        bin_buf.clear();
+                        bin_buf.reserve(total_evs);
+                        unsafe {
+                            bin_buf.set_len(total_evs);
+                        }
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2669,7 +2733,11 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        unsafe {
+                            sorted_evs.set_len(total_evs);
+                        }
                         for &(lpid, packed_ev) in &bin_buf[..total_evs] {
                             let dst = ev_counts[lpid as usize] as usize;
                             ev_counts[lpid as usize] = (dst + 1) as u32;
@@ -2706,7 +2774,11 @@ fn main() -> io::Result<()> {
                         }
                         ev_offs[num_people] = acc;
 
-                        sorted_evs.resize(total_evs, 0);
+                        sorted_evs.clear();
+                        sorted_evs.reserve(total_evs);
+                        unsafe {
+                            sorted_evs.set_len(total_evs);
+                        }
                         let mut k = 0usize;
                         for t in 0..pew {
                             let evs = unsafe { pe_ref.get_mut(t, sh) };
@@ -2759,14 +2831,12 @@ fn main() -> io::Result<()> {
                     }
                     clk_offs[num_people] = cacc;
 
-                    sorted_clks.resize(
-                        clk_tmp.len(),
-                        CompactClick {
-                            ts_rel: 0,
-                            campaign_idx: 0,
-                            click_id: Key::EMPTY,
-                        },
-                    );
+                    let clen_tmp = clk_tmp.len();
+                    sorted_clks.clear();
+                    sorted_clks.reserve(clen_tmp);
+                    unsafe {
+                        sorted_clks.set_len(clen_tmp);
+                    }
                     for &(lpid, cc) in &clk_tmp {
                         let dst = clk_counts[lpid as usize] as usize;
                         clk_counts[lpid as usize] = (dst + 1) as u32;
@@ -2779,11 +2849,15 @@ fn main() -> io::Result<()> {
                         let pclks =
                             &mut sorted_clks[clk_offs[p] as usize..clk_offs[p + 1] as usize];
                         if pclks.len() > 1 {
-                            pclks.sort_unstable_by(|a, b| {
-                                a.ts_rel
-                                    .cmp(&b.ts_rel)
-                                    .then_with(|| b.click_id.cmp_bytes(&a.click_id))
-                            });
+                            if pclks.len() <= 16 {
+                                insertion_sort_clicks(pclks);
+                            } else {
+                                pclks.sort_unstable_by(|a, b| {
+                                    a.ts_rel
+                                        .cmp(&b.ts_rel)
+                                        .then_with(|| b.click_id.cmp_bytes(&a.click_id))
+                                });
+                            }
                         }
 
                         let mut c_lo = 0usize;

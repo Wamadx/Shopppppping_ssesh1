@@ -47,24 +47,28 @@ impl EidArena {
         self.encode_long(s, worker_id)
     }
 
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn encode_long(&mut self, s: &[u8], worker_id: usize) -> Option<Key> {
-        if worker_id >= 16 || s.len() > u16::MAX as usize {
+        let slen = s.len();
+        if worker_id >= 16 || slen > u16::MAX as usize {
             return None;
         }
         let aligned = (self.buf.len() + 3) & !3;
-        let need = aligned.checked_add(2)?.checked_add(s.len())?;
-        if need > EID_ARENA_MAX_BYTES {
+        let end_padded = (aligned + 2 + slen + 3) & !3;
+        if end_padded > EID_ARENA_MAX_BYTES {
             return None;
         }
-        if aligned > self.buf.len() {
-            self.buf.resize(aligned, 0);
+        if end_padded > self.buf.capacity() {
+            self.buf.reserve(end_padded - self.buf.len());
+        }
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(aligned);
+            std::ptr::copy_nonoverlapping((slen as u16).to_le_bytes().as_ptr(), dst, 2);
+            std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(2), slen);
+            self.buf.set_len(end_padded);
         }
         let h = hash_bytes(s);
         let h33 = (h >> 31) & 0x1_FFFF_FFFF;
-        self.buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
-        self.buf.extend_from_slice(s);
         Some(Key(
             INTERNED_BIT | (h33 << 30) | ((worker_id as u64) << 26) | ((aligned as u64) >> 2),
         ))
@@ -77,9 +81,21 @@ fn hash_word(h: u64, word: u64) -> u64 {
 }
 
 /// Fast, deterministic hash used once for the shard, table, and local cache.
-#[inline]
+#[inline(always)]
 fn hash_bytes(mut s: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ s.len() as u64;
+    let len = s.len();
+    if len >= 16 {
+        let p = s.as_ptr();
+        let w0 = u64::from_le(unsafe { (p as *const u64).read_unaligned() });
+        let w1 = u64::from_le(unsafe { (p.add(8) as *const u64).read_unaligned() });
+        let wn = u64::from_le(unsafe { (p.add(len - 8) as *const u64).read_unaligned() });
+        let wm = u64::from_le(unsafe { (p.add(len >> 1) as *const u64).read_unaligned() });
+        let a = (w0 ^ (len as u64)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95) ^ wn;
+        let b = (w1 ^ wm).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (w0.rotate_left(23));
+        let r = (a as u128).wrapping_mul((b ^ 0xcbf2_9ce4_8422_2325) as u128);
+        return (r as u64) ^ ((r >> 64) as u64);
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ len as u64;
     while s.len() >= 8 {
         let w = u64::from_le(unsafe { (s.as_ptr() as *const u64).read_unaligned() });
         h = hash_word(h, w);
@@ -848,29 +864,57 @@ unsafe fn for_each_record_avx2<const N: usize>(
                     let line_qt1 = qt1 & before_nl1;
                     if (line_cm0.count_ones() + line_cm1.count_ones()) as usize == N - 1 {
                         let total_q = qt.count_ones() + line_qt1.count_ones();
-                        let mut j = 0usize;
-                        while line_cm0 != 0 {
-                            let cb_bit = line_cm0.trailing_zeros();
-                            let coff = blk + cb_bit as usize;
-                            f_starts[j] = cur_fstart;
-                            f_ends[j] = coff;
-                            j += 1;
-                            cur_fstart = coff + 1;
-                            line_cm0 &= line_cm0 - 1;
-                        }
-                        while line_cm1 != 0 {
-                            let cb_bit = line_cm1.trailing_zeros();
-                            let coff = blk1 + cb_bit as usize;
-                            f_starts[j] = cur_fstart;
-                            f_ends[j] = coff;
-                            j += 1;
-                            cur_fstart = coff + 1;
-                            line_cm1 &= line_cm1 - 1;
-                        }
-                        f_starts[N - 1] = cur_fstart;
-                        f_ends[N - 1] = nl_off;
-                        if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                        if total_q == 0 {
+                            let mut j = 0usize;
+                            while line_cm0 != 0 {
+                                let cb_bit = line_cm0.trailing_zeros();
+                                let coff = blk + cb_bit as usize;
+                                fields[j] = unsafe {
+                                    std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart)
+                                };
+                                j += 1;
+                                cur_fstart = coff + 1;
+                                line_cm0 &= line_cm0 - 1;
+                            }
+                            while line_cm1 != 0 {
+                                let cb_bit = line_cm1.trailing_zeros();
+                                let coff = blk1 + cb_bit as usize;
+                                fields[j] = unsafe {
+                                    std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart)
+                                };
+                                j += 1;
+                                cur_fstart = coff + 1;
+                                line_cm1 &= line_cm1 - 1;
+                            }
+                            fields[N - 1] = unsafe {
+                                std::slice::from_raw_parts(ptr.add(cur_fstart), nl_off - cur_fstart)
+                            };
                             cb(fields);
+                        } else {
+                            let mut j = 0usize;
+                            while line_cm0 != 0 {
+                                let cb_bit = line_cm0.trailing_zeros();
+                                let coff = blk + cb_bit as usize;
+                                f_starts[j] = cur_fstart;
+                                f_ends[j] = coff;
+                                j += 1;
+                                cur_fstart = coff + 1;
+                                line_cm0 &= line_cm0 - 1;
+                            }
+                            while line_cm1 != 0 {
+                                let cb_bit = line_cm1.trailing_zeros();
+                                let coff = blk1 + cb_bit as usize;
+                                f_starts[j] = cur_fstart;
+                                f_ends[j] = coff;
+                                j += 1;
+                                cur_fstart = coff + 1;
+                                line_cm1 &= line_cm1 - 1;
+                            }
+                            f_starts[N - 1] = cur_fstart;
+                            f_ends[N - 1] = nl_off;
+                            if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                                cb(fields);
+                            }
                         }
                     }
                     let next_line = nl_off + 1;
@@ -894,18 +938,34 @@ unsafe fn for_each_record_avx2<const N: usize>(
 
                 if fidx == 0 && !too_many && line_commas == N - 1 {
                     let total_q = q_cnt + line_qt.count_ones();
-                    for j in 0..(N - 1) {
-                        let cb_bit = line_cm.trailing_zeros();
-                        let coff = blk + cb_bit as usize;
-                        f_starts[j] = cur_fstart;
-                        f_ends[j] = coff;
-                        cur_fstart = coff + 1;
-                        line_cm &= line_cm - 1;
-                    }
-                    f_starts[N - 1] = cur_fstart;
-                    f_ends[N - 1] = nl_off;
-                    if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                    if total_q == 0 {
+                        for j in 0..(N - 1) {
+                            let cb_bit = line_cm.trailing_zeros();
+                            let coff = blk + cb_bit as usize;
+                            fields[j] = unsafe {
+                                std::slice::from_raw_parts(ptr.add(cur_fstart), coff - cur_fstart)
+                            };
+                            cur_fstart = coff + 1;
+                            line_cm &= line_cm - 1;
+                        }
+                        fields[N - 1] = unsafe {
+                            std::slice::from_raw_parts(ptr.add(cur_fstart), nl_off - cur_fstart)
+                        };
                         cb(fields);
+                    } else {
+                        for j in 0..(N - 1) {
+                            let cb_bit = line_cm.trailing_zeros();
+                            let coff = blk + cb_bit as usize;
+                            f_starts[j] = cur_fstart;
+                            f_ends[j] = coff;
+                            cur_fstart = coff + 1;
+                            line_cm &= line_cm - 1;
+                        }
+                        f_starts[N - 1] = cur_fstart;
+                        f_ends[N - 1] = nl_off;
+                        if validate_and_unquote::<N>(buf, &f_starts, &f_ends, total_q, &mut fields) {
+                            cb(fields);
+                        }
                     }
                 } else if !too_many && fidx + line_commas == N - 1 {
                     let total_q = q_cnt + line_qt.count_ones();
