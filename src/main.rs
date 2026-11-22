@@ -2101,6 +2101,13 @@ fn read_events_tickets(
                 let mut dc_ts = DateCache::new();
                 let mut buf = Vec::new();
                 let mut bad = false;
+                // Long hex user IDs are probed (slot prefetched) when parsed and resolved
+                // HEX_RING rows later, so the table miss overlaps parsing of later rows.
+                const HEX_RING: usize = 16;
+                let mut ring: [(u32, csv_ts::HexProbe, *const u8); HEX_RING] =
+                    [(0, csv_ts::HexProbe::default(), std::ptr::null()); HEX_RING];
+                let mut ring_n = 0usize;
+                let mut ring_head = 0usize;
                 loop {
                     if bad || bail_ref.load(Ordering::Relaxed) {
                         break;
@@ -2180,8 +2187,24 @@ fn read_events_tickets(
                                     bad = true;
                                     return;
                                 }
+                                let user_id = if let Some(pr) = csv_ts::hex_user_probe(uid) {
+                                    if ring_n == HEX_RING {
+                                        let (idx, op, optr) = ring[ring_head];
+                                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                                        unsafe { payloads.get_unchecked_mut(idx as usize) }.user_id =
+                                            csv_ts::hex_user_resolve(&op, os);
+                                        ring_head = (ring_head + 1) % HEX_RING;
+                                        ring_n -= 1;
+                                    }
+                                    let slot = (ring_head + ring_n) % HEX_RING;
+                                    ring[slot] = (l as u32, pr, uid.as_ptr());
+                                    ring_n += 1;
+                                    Key::EMPTY
+                                } else {
+                                    Key::from_bytes(uid)
+                                };
                                 payloads.push(Payload {
-                                    user_id: Key::from_bytes(uid),
+                                    user_id,
                                     packed_ev: ((ts_rel as u64) << 32) | (price_cat as u64),
                                 });
                                 l as u32
@@ -2200,6 +2223,15 @@ fn read_events_tickets(
                             );
                         },
                     );
+                    // Resolve the rest before the chunk buffer is reused.
+                    while ring_n > 0 {
+                        let (idx, op, optr) = ring[ring_head];
+                        let os = unsafe { std::slice::from_raw_parts(optr, 33) };
+                        unsafe { payloads.get_unchecked_mut(idx as usize) }.user_id =
+                            csv_ts::hex_user_resolve(&op, os);
+                        ring_head = (ring_head + 1) % HEX_RING;
+                        ring_n -= 1;
+                    }
                 }
                 if bad {
                     bail_ref.store(true, Ordering::Relaxed);

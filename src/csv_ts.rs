@@ -434,18 +434,38 @@ fn pack_hex32(s: &[u8]) -> Option<(u64, u64)> {
     Some((a, b))
 }
 
-/// Canonical Key for a `u` + 32 lowercase hex ID, or None to use the general path.
-/// Every such string goes through this table only, so canonical keys stay unique.
+/// A parsed `u` + 32 lowercase hex user ID whose table slot has been prefetched.
+#[derive(Clone, Copy, Default)]
+pub struct HexProbe {
+    hi: u64,
+    lo: u64,
+    pos: usize,
+}
+
+/// Packs a `u` + 32 lowercase hex ID and prefetches its home slot, or None for any other shape.
 #[inline(always)]
-fn intern_hex_user(s: &[u8]) -> Option<Key> {
+pub fn hex_user_probe(s: &[u8]) -> Option<HexProbe> {
     if s.len() != 33 || s[0] != b'u' {
         return None;
     }
     let (hi, lo) = pack_hex32(&s[1..])?;
     let t = hex_table();
     let h = (hi ^ lo.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let pos = (h >> (64 - t.log2)) as usize;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(t.slots.add(pos) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    Some(HexProbe { hi, lo, pos })
+}
+
+/// Canonical Key for a probed ID; `s` must be the same bytes the probe was made from.
+#[inline(always)]
+pub fn hex_user_resolve(p: &HexProbe, s: &[u8]) -> Key {
+    let t = hex_table();
+    let (hi, lo) = (p.hi, p.lo);
     let mask = (1usize << t.log2) - 1;
-    let mut pos = (h >> (64 - t.log2)) as usize;
+    let mut pos = p.pos;
     loop {
         let slot = unsafe { &*t.slots.add(pos) };
         let mut k = slot.key.load(Ordering::Acquire);
@@ -463,7 +483,7 @@ fn intern_hex_user(s: &[u8]) -> Option<Key> {
                         (*sp).lo = lo;
                     }
                     slot.key.store(key.0, Ordering::Release);
-                    return Some(key);
+                    return key;
                 }
                 Err(actual) => k = actual,
             }
@@ -474,10 +494,18 @@ fn intern_hex_user(s: &[u8]) -> Option<Key> {
         }
         let (shi, slo) = unsafe { ((*t.slots.add(pos)).hi, (*t.slots.add(pos)).lo) };
         if shi == hi && slo == lo {
-            return Some(Key(k));
+            return Key(k);
         }
         pos = (pos + 1) & mask;
     }
+}
+
+/// Canonical Key for a `u` + 32 lowercase hex ID, or None to use the general path.
+/// Every such string goes through this table only, so canonical keys stay unique.
+#[inline(always)]
+fn intern_hex_user(s: &[u8]) -> Option<Key> {
+    let p = hex_user_probe(s)?;
+    Some(hex_user_resolve(&p, s))
 }
 
 static FAST_INTERNERS: OnceLock<[FastInterner; NUM_INTERN_SHARDS]> = OnceLock::new();
