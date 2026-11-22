@@ -1507,7 +1507,7 @@ fn read_events_parallel(
                                 }
                             }
 
-                            let event_id = Key::from_bytes(eid);
+                            let event_id = Key::from_bytes_unique(eid);
                             let user_id = if ts_rel != u32::MAX {
                                 Key::from_bytes(uid)
                             } else {
@@ -2025,7 +2025,7 @@ fn read_events_tickets(
                                 }
                             }
 
-                            let event_id = Key::from_bytes(eid);
+                            let event_id = Key::from_bytes_unique(eid);
                             let loc = if ts_rel != u32::MAX {
                                 let l = payloads.len();
                                 if l >= loc_max {

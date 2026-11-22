@@ -334,18 +334,25 @@ impl Key {
 
     #[inline(always)]
     pub fn from_bytes(s: &[u8]) -> Self {
-        Self::from_bytes_impl(s, true)
+        Self::from_bytes_impl(s, 0)
     }
 
     /// Keeps stable bytes for comparisons but does not canonicalize identity.
     /// Only for fields such as click_id that are ordered, never hashed/routed.
     #[inline(always)]
     pub fn from_bytes_unordered(s: &[u8]) -> Self {
-        Self::from_bytes_impl(s, false)
+        Self::from_bytes_impl(s, 1)
+    }
+
+    /// Canonical identity like `from_bytes`, but optimistic for mostly unique
+    /// streams: probe for insertion directly instead of doing a lookup first.
+    #[inline(always)]
+    pub fn from_bytes_unique(s: &[u8]) -> Self {
+        Self::from_bytes_impl(s, 2)
     }
 
     #[inline(always)]
-    fn from_bytes_impl(s: &[u8], intern: bool) -> Self {
+    fn from_bytes_impl(s: &[u8], kind: u8) -> Self {
         let len = s.len();
         if len >= 1 && len <= 9 {
             #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -353,7 +360,7 @@ impl Key {
                 if let Some(k) = unsafe { Self::pack_bmi2(s) } {
                     return k;
                 }
-                return Self::id_slow(s, intern);
+                return Self::id_slow(s, kind);
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             {
@@ -363,7 +370,7 @@ impl Key {
                 while i < len {
                     let b = s[i];
                     if b == 0 || b >= 0x80 {
-                        return Self::id_slow(s, intern);
+                        return Self::id_slow(s, kind);
                     }
                     acc |= (b as u64) << shift;
                     shift -= 7;
@@ -372,13 +379,13 @@ impl Key {
                 return Self(acc);
             }
         }
-        Self::id_slow(s, intern)
+        Self::id_slow(s, kind)
     }
 
     #[inline(always)]
-    fn id_slow(s: &[u8], intern: bool) -> Self {
-        if intern {
-            return Self::intern_slow(s, hash_bytes(s));
+    fn id_slow(s: &[u8], kind: u8) -> Self {
+        if kind != 1 {
+            return Self::intern_slow(s, hash_bytes(s), kind == 2);
         }
         let stored = INTERN_ARENA.with(|arena| arena.borrow_mut().alloc(s));
         let ptr = stored.as_ptr() as usize as u64;
@@ -386,7 +393,7 @@ impl Key {
         if len != 0 && len <= INTERNED_LEN_MASK && ptr <= INTERNED_PTR_MASK {
             Self(INTERNED_BIT | (len << INTERNED_LEN_SHIFT) | ptr)
         } else {
-            Self::intern_slow(s, hash_bytes(s))
+            Self::intern_slow(s, hash_bytes(s), false)
         }
     }
 
@@ -445,7 +452,7 @@ impl Key {
     }
 
     #[inline]
-    fn intern_slow(s: &[u8], hash: u64) -> Self {
+    fn intern_slow(s: &[u8], hash: u64, insert_first: bool) -> Self {
         let cache_slot = ((hash >> 24) as usize) & (INTERN_CACHE_SLOTS - 1);
         let cached = INTERN_CACHE.with(|cache| {
             let entry = cache.borrow()[cache_slot];
@@ -461,8 +468,13 @@ impl Key {
 
         let sh = ((hash >> 56) as usize) & (NUM_INTERN_SHARDS - 1);
         let fast = &fast_interners()[sh];
-        let key = if let Some(key) = fast.lookup(s, hash, sh) {
-            key
+        let key = if !insert_first {
+            if let Some(key) = fast.lookup(s, hash, sh) {
+                key
+            } else {
+                fast.intern(s, hash, sh)
+                    .unwrap_or_else(|| fast.fallback(s, hash, sh))
+            }
         } else {
             fast.intern(s, hash, sh)
                 .unwrap_or_else(|| fast.fallback(s, hash, sh))
